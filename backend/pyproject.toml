@@ -1,0 +1,103 @@
+[project]
+name = "prescripto-api"
+version = "0.1.0"
+description = "Prescripto — GED intelligente pour l'economiste de la construction"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.115",
+    "uvicorn[standard]>=0.34",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "qdrant-client>=1.13,<1.15",
+    # Upper bound is load-bearing: 2.x moved the client to `mistralai.client` and
+    # turned the root into a namespace package, so `from mistralai import Mistral`
+    # raises ImportError and the whole app stops importing. Last 1.x is 1.12.x.
+    "mistralai>=1.0,<2",
+    "bcrypt>=4.0",
+    "python-jose[cryptography]>=3.3",
+    "python-multipart>=0.0.18",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "pymupdf>=1.25",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "httpx>=0.28",
+    "aiosmtplib>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6,<7",
+    "httpx>=0.28",
+    # `ruff format --check` is a gate, and formatter output shifts between minor
+    # versions: an unbounded constraint would break that gate with no code change,
+    # which is the exact failure this file is being edited to fix.
+    "ruff>=0.15,<0.17",
+    "aiosqlite>=0.20",  # in-memory DB for the service tests
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# The TDD freeze (.claude/hooks/tdd-freeze-tests-py.py) treats a proved test file
+# as a specification. `ruff format .` rewrites from the shell, where no PreToolUse
+# hook can see it — it would reformat the frozen half and flip the RED marker's
+# digest. See .claude/rules/07-backend.md, "ruff format is scoped to app/".
+extend-exclude = ["tests/services"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "TCH"]
+# `ruff format` owns line length for code. What it cannot wrap is a long string
+# literal, and every E501 left in app/ is one — LLM prompts, log f-strings, one
+# docstring. Keeping E501 on would mean hand-splitting prompt text, where a lost
+# space silently changes what the model receives and no test would catch it.
+#
+# Known cost, accepted rather than hidden: this is repo-wide, so it also silences
+# the 38 E501 in alembic/versions/, and those ARE code (long `sa.Column(...)`
+# lines). Those files get no formatter either — `ruff format` is scoped to app/
+# on purpose — so they are now the one directory with neither. They stay under
+# every other rule (F, B, SIM, N…), which is why excluding them outright was
+# rejected: 06-database.md makes that the one directory edited by hand.
+ignore = ["E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency markers are calls in argument defaults BY DESIGN — B008
+# flags them as the mutable-default bug, which they are not.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Query",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# WITHOUT THIS LINE NOTHING RUNS: the console script does not put the project
+# root on sys.path, and tests/conftest.py imports `from app.main import app` on
+# its first line. Resolution used to work only through a leftover editable
+# install (prescripto_api.egg-info), i.e. by accident, not by configuration.
+pythonpath = ["."]
+# Raised at backend-test-infra-fk-coverage, at the floor MEASURED after the
+# SQLite FK-enforcement fix and its cascade tests, rounded DOWN: 56.96% -> 56.
+# A floor is a floor, not a target — raise it as coverage climbs, never lower
+# it to make a gate pass (`.claude/rules/07-backend.md`).
+addopts = "--cov=app --cov-report=term-missing --cov-fail-under=56"
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/main.py", "*/alembic/*", "*/tests/*"]
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]

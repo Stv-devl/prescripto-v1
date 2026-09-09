@@ -1,0 +1,80 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+.ruff_cache/
+
+# Node
+node_modules/
+dist/
+
+# Test output
+coverage/
+.vitest-cache/
+playwright-report/
+# Written on every backend run since pyproject's addopts carries --cov=app.
+# A SQLite file holding this machine's absolute paths — never commit it.
+.coverage
+.coverage.*
+test-results/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Uploads
+backend/uploads/
+
+# Docker volumes
+pgdata/
+qdrant_data/
+
+# Test documents
+*.pdf
+node_modules
+
+# === Workflow agentic — présent en local, jamais poussé sur ce repo public ===
+# Contrairement au repo source (AgentConstech), où .claude/ EST versionné : ici
+# c'est un choix inverse et délibéré (prescripto-v1 est public sur GitHub).
+.claude/
+sprint/
+CLAUDE.md
+AGENTS.md
+workflow.py
+workflow.sh
+codex-handoff.sh
+docs/Claude_Workflows.md
+docs/loopkit-journal.md
+docs/ADAPTATION.md
+docs/archive/
+docs/research-cache/
+docs/product/
+
+# === LoopKit — état de session ===
+# Écrit à l'exécution par les hooks et le status line. Jamais versionné :
+# committer ça, c'est expédier à toute l'équipe les seuils de contexte et les
+# marqueurs TDD d'un seul poste.
+.claude/worktrees/
+.claude/.hook-timings.log
+.claude/.eslint-queue
+.claude/.eslint-queue.*
+.claude/.token-warning
+.claude/.token-stop-agents
+.claude/.codex-ready
+.claude/.quota-warning
+.claude/.tdd-red/
+# .claude/.tdd-unfrozen n'est délibérément PAS ignoré : toute la raison d'être de
+# la liste d'exceptions TDD est d'être visible en review (.claude/rules/05-testing.md).

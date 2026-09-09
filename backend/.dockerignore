@@ -1,0 +1,35 @@
+# Docker does NOT read .gitignore. Without this file, the `COPY . .` of the
+# Dockerfile bakes into the image everything .gitignore was protecting — first
+# among them `.env`, whose ENVIRONMENT=local turns off authentication entirely
+# (api/deps.py serves every unauthenticated request as the seeded dev user, and
+# main.py gives that account role="admin"). Second, `uploads/`: the clients'
+# CCTP corpus, readable by anyone who can pull the image.
+#
+# Found by the /audit:security authz surface on 2026-09-03.
+
+# Secrets. The single most important line in this file.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.*
+
+# Client corpus — confidential, never published (CLAUDE.md, Protected Files)
+uploads/
+
+# Local environments and caches: useless in the image, and they carry
+# absolute paths from the build machine.
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+*.egg-info/
+
+# Tests and tooling do not ship: the image runs the app, it does not test it.
+tests/

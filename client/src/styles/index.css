@@ -1,0 +1,377 @@
+@import "tailwindcss";
+
+/* =============================================================================
+   CSS CUSTOM PROPERTIES (Design Tokens)
+   ============================================================================= */
+
+/* Dark theme (default) */
+:root {
+  --background: 0 0% 11%; /* #1C1C1C - Noir mat */
+  --foreground: 0 0% 96%; /* #F5F5F5 - Texte clair */
+  --secondary: 0 0% 17%; /* #2B2B2B - Gris foncé */
+  --secondary-foreground: 0 0% 96%;
+  --card: 0 0% 17%; /* #2B2B2B */
+  --card-foreground: 0 0% 96%;
+  --muted: 0 0% 22%;
+  --muted-foreground: 0 0% 64%;
+  --border: 0 0% 25%;
+  --input: 0 0% 25%;
+  --ring: 45 100% 50%; /* #FFC300 */
+  --primary: 45 100% 50%;
+  --primary-foreground: 0 0% 11%;
+  --accent: 45 100% 50%;
+  --accent-foreground: 0 0% 11%;
+  --destructive: 0 91% 71%;
+}
+
+/* Light theme */
+.light {
+  --background: 228 10% 96%; /* #F3F4F7 - Gris très clair bleuté */
+  --foreground: 0 0% 11%; /* #1C1C1C */
+  --secondary: 228 8% 93%; /* #ECEDF2 */
+  --secondary-foreground: 0 0% 11%;
+  --card: 0 0% 100%; /* #FFFFFF */
+  --card-foreground: 0 0% 11%;
+  --muted: 228 8% 91%;
+  --muted-foreground: 0 0% 38%;
+  --border: 228 8% 88%; /* #DDDFE6 */
+  --input: 228 8% 88%;
+  --ring: 45 100% 50%;
+  --primary: 45 100% 44%;
+  --primary-foreground: 0 0% 11%;
+  --accent: 45 100% 44%;
+  --accent-foreground: 0 0% 11%;
+  --destructive: 0 74% 42%;
+}
+
+/* =============================================================================
+   GLOBAL RESETS & BASE STYLES
+   ============================================================================= */
+
+/* Smooth theme transition on all elements */
+*,
+*::before,
+*::after {
+  border-color: hsl(var(--border));
+  transition-property: background-color, border-color, color, box-shadow;
+  transition-duration: 0ms;
+  transition-timing-function: ease-in-out;
+}
+
+/* Enable smooth transition only when theme is switching */
+html.theme-transitioning *,
+html.theme-transitioning *::before,
+html.theme-transitioning *::after {
+  transition-duration: 500ms !important;
+}
+
+/* Base body styles */
+body {
+  font-family:
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Roboto,
+    Oxygen,
+    Ubuntu,
+    Cantarell,
+    "Open Sans",
+    "Helvetica Neue",
+    sans-serif;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* =============================================================================
+   UTILITY CLASSES (Extend Tailwind)
+   ============================================================================= */
+
+/* Muted text color utility */
+.text-muted-foreground {
+  color: hsl(var(--muted-foreground));
+}
+
+/* Muted background utility */
+.bg-muted {
+  background-color: hsl(var(--muted));
+}
+
+/* =============================================================================
+   CONTAINER
+   ============================================================================= */
+
+.container {
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+  max-width: 1950px;
+}
+
+/* =============================================================================
+   COMPONENT STYLES
+   ============================================================================= */
+
+/* Auth card - elevated card with layered shadow */
+.auth-card {
+  box-shadow:
+    0 4px 6px -1px rgba(0, 0, 0, 0.1),
+    0 10px 15px -3px rgba(0, 0, 0, 0.1),
+    0 20px 25px -5px rgba(0, 0, 0, 0.1);
+}
+
+/* =============================================================================
+   BUTTON OVERRIDES
+   ============================================================================= */
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* =============================================================================
+   FORM HELPERS
+   ============================================================================= */
+
+/* Password hint text (shown below password inputs) */
+.password-hint {
+  font-size: 0.75rem;
+  font-style: italic;
+  color: hsl(var(--muted-foreground));
+  margin-top: 0.25rem;
+}
+
+/* =============================================================================
+   PROSE CHAT — Markdown rendering in assistant messages
+   ============================================================================= */
+
+/* =============================================================================
+   CONVERSATION SIDEBAR — Slide animations for new conversation title
+   ============================================================================= */
+
+@keyframes slide-out-right {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+}
+
+@keyframes slide-in-left {
+  from {
+    opacity: 0;
+    transform: translateX(-100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-slide-out-right {
+  animation: slide-out-right 0.25s ease-in forwards;
+}
+
+.animate-slide-in-left {
+  animation: slide-in-left 0.25s ease-out forwards;
+}
+
+/* =============================================================================
+   THINKING INDICATOR — Bouncing dots animation
+   ============================================================================= */
+
+@keyframes thinking-bounce {
+  0%,
+  80%,
+  100% {
+    transform: scale(0.6);
+    opacity: 0.3;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.thinking-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+  border-radius: 9999px;
+  background-color: #ffc300;
+  animation: thinking-bounce 1.2s ease-in-out infinite;
+}
+
+/* =============================================================================
+   PROSE CHAT — Markdown rendering in assistant messages
+   ============================================================================= */
+
+.prose-chat {
+  line-height: 1.6;
+}
+
+.prose-chat > * + * {
+  margin-top: 0.75em;
+}
+
+.prose-chat p {
+  margin: 0;
+}
+
+.prose-chat p + p {
+  margin-top: 0.5em;
+}
+
+.prose-chat strong {
+  color: hsl(var(--foreground));
+  font-weight: 600;
+}
+
+.prose-chat em {
+  font-style: italic;
+  color: hsl(var(--muted-foreground));
+}
+
+.prose-chat h1,
+.prose-chat h2,
+.prose-chat h3 {
+  font-weight: 600;
+  color: hsl(var(--foreground));
+  margin-top: 1em;
+  margin-bottom: 0.25em;
+}
+
+.prose-chat h1 {
+  font-size: 1.25em;
+}
+.prose-chat h2 {
+  font-size: 1.125em;
+}
+.prose-chat h3 {
+  font-size: 1em;
+}
+
+.prose-chat ul,
+.prose-chat ol {
+  padding-left: 1.25em;
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+.prose-chat ul {
+  list-style-type: disc;
+}
+
+.prose-chat ol {
+  list-style-type: decimal;
+}
+
+.prose-chat li {
+  margin-top: 0.25em;
+}
+
+.prose-chat li::marker {
+  color: #ffc300;
+}
+
+.prose-chat code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 0.85em;
+  background-color: hsl(var(--muted));
+  padding: 0.15em 0.35em;
+  border-radius: 0.25em;
+}
+
+.prose-chat pre {
+  background-color: hsl(var(--muted));
+  border-radius: 0.375em;
+  padding: 0.75em 1em;
+  overflow-x: auto;
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+.prose-chat pre code {
+  background: none;
+  padding: 0;
+}
+
+.prose-chat blockquote {
+  border-left: 3px solid #ffc300;
+  padding-left: 0.75em;
+  color: hsl(var(--muted-foreground));
+  font-style: italic;
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+.prose-chat hr {
+  border: none;
+  border-top: 1px solid hsl(var(--border));
+  margin: 0.75em 0;
+}
+
+.prose-chat a {
+  color: #ffc300;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.prose-chat a:hover {
+  color: #ffd54f;
+}
+
+/* =============================================================================
+   LANDING HERO — Cloud drift animation & mask
+   ============================================================================= */
+
+@keyframes clouds-drift {
+  0% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(-60px);
+  }
+  100% {
+    transform: translateX(0);
+  }
+}
+
+.animate-clouds-drift {
+  animation: clouds-drift 30s ease-in-out infinite;
+}
+
+/* =============================================================================
+   SUMMARY — Step fade-in animation
+   ============================================================================= */
+
+@keyframes fadeSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.landing-hero-mask {
+  mask-image: radial-gradient(
+    ellipse 80% 70% at 50% 40%,
+    black 30%,
+    transparent 80%
+  );
+  -webkit-mask-image: radial-gradient(
+    ellipse 80% 70% at 50% 40%,
+    black 30%,
+    transparent 80%
+  );
+}

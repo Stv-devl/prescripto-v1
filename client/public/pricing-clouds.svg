@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 600" fill="none">
+  <defs>
+    <filter id="blur1" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="70" />
+    </filter>
+    <filter id="blur2" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="90" />
+    </filter>
+    <filter id="blur3" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="55" />
+    </filter>
+  </defs>
+  <!-- Cloud shapes - dark/grey organic blobs -->
+  <ellipse cx="250" cy="220" rx="300" ry="150" fill="#2B2B2B" fill-opacity="0.5" filter="url(#blur1)" />
+  <ellipse cx="750" cy="160" rx="340" ry="170" fill="#333333" fill-opacity="0.4" filter="url(#blur2)" />
+  <ellipse cx="1150" cy="350" rx="280" ry="140" fill="#2B2B2B" fill-opacity="0.45" filter="url(#blur1)" />
+  <ellipse cx="450" cy="420" rx="320" ry="130" fill="#333333" fill-opacity="0.3" filter="url(#blur2)" />
+  <ellipse cx="1000" cy="130" rx="220" ry="110" fill="#2B2B2B" fill-opacity="0.4" filter="url(#blur3)" />
+  <ellipse cx="1350" cy="240" rx="260" ry="150" fill="#333333" fill-opacity="0.35" filter="url(#blur1)" />
+  <ellipse cx="100" cy="120" rx="200" ry="100" fill="#2B2B2B" fill-opacity="0.4" filter="url(#blur3)" />
+  <ellipse cx="650" cy="400" rx="270" ry="120" fill="#333333" fill-opacity="0.25" filter="url(#blur2)" />
+</svg>
