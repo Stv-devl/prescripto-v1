@@ -10,7 +10,7 @@ docker compose -f docker-compose.dev.yml up -d
 
 ```bash
 cd backend
-cp .env.example .env      # une seule fois — puis renseigner MISTRAL_API_KEY et JWT_SECRET_KEY
+[ -f .env ] || cp .env.example .env   # ne copie que si absent — puis renseigner MISTRAL_API_KEY et JWT_SECRET_KEY
 uv sync --extra dev       # installe les dépendances dans .venv/ (uv, jamais pip)
 uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
@@ -29,7 +29,8 @@ pnpm dev
 
 ## Auth
 
-Pas de compte requis en dev : `ENVIRONMENT=local` bypass l'authentification avec un user/tenant dev cree automatiquement au demarrage.
+Pas de compte requis en dev : `ENVIRONMENT=local` bypass l'authentification avec
+un user/tenant dev cree automatiquement au demarrage.
 
 ## URLs
 

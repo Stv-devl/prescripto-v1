@@ -7,6 +7,7 @@ from datetime import datetime
 
 from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
 
+from app.core.config import settings
 from app.core.mistral import mistral_client
 from app.core.qdrant import qdrant_client
 from app.services.ingestion.chunking import TextChunk
@@ -14,7 +15,13 @@ from app.services.qdrant_payload import ChunkPayloadFields, build_chunk_payload
 
 logger = logging.getLogger(__name__)
 
-COLLECTION_NAME = "documents"
+
+def collection_name_for(retrieval_mode: str) -> str:
+    """Resolve the Qdrant collection name for a retrieval mode."""
+    return "documents" if retrieval_mode == "baseline" else f"documents_{retrieval_mode}"
+
+
+COLLECTION_NAME = collection_name_for(settings.retrieval_mode)
 EMBEDDING_MODEL = "mistral-embed"
 VECTOR_SIZE = 1024
 BATCH_SIZE = 10

@@ -42,6 +42,16 @@ class Settings(BaseSettings):
 
     qdrant_url: str = "http://localhost:6333"
 
+    retrieval_mode: Literal["baseline", "v1"] = Field(
+        default="baseline",
+        description=(
+            "Selects the Qdrant collection: baseline -> 'documents', "
+            "v1 -> 'documents_v1'. The sprint A/B switch (sprint/PLAN-SPRINT.md "
+            "§ 2) — both stay runnable at any time, the baseline collection is "
+            "never overwritten by a v1 re-ingestion."
+        ),
+    )
+
     mistral_api_key: str
     pixtral_large_model: str = "pixtral-large-latest"
     pixtral_small_model: str = "pixtral-12b-2409"
