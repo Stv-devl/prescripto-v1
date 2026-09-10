@@ -200,3 +200,17 @@ class TestEnsureCollectionPayloadIndexes:
         with patch("app.services.ingestion.embedding.qdrant_client", store):
             with pytest.raises(UnexpectedResponse):
                 await ensure_collection()
+
+
+class TestCollectionNameFor:
+    """The sprint A/B switch (sprint/PLAN-SPRINT.md § 2): both modes stay runnable."""
+
+    def test_baseline_maps_to_the_original_collection(self) -> None:
+        from app.services.ingestion.embedding import collection_name_for
+
+        assert collection_name_for("baseline") == "documents"
+
+    def test_a_non_baseline_mode_gets_its_own_collection(self) -> None:
+        from app.services.ingestion.embedding import collection_name_for
+
+        assert collection_name_for("v1") == "documents_v1"

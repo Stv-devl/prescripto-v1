@@ -184,3 +184,17 @@ class TestDeployedRefusesAnUnusableRateLimitKey:
     def test_local_never_refuses(self) -> None:
         """A developer runs without a proxy at all; the key is already the client."""
         assert _settings(environment="local", forwarded_allow_ips="").environment == "local"
+
+
+class TestRetrievalMode:
+    """The sprint A/B switch (sprint/PLAN-SPRINT.md § 2): baseline stays the default."""
+
+    def test_defaults_to_baseline(self) -> None:
+        assert _settings().retrieval_mode == "baseline"
+
+    def test_accepts_v1(self) -> None:
+        assert _settings(retrieval_mode="v1").retrieval_mode == "v1"
+
+    def test_refuses_an_unknown_mode(self) -> None:
+        with pytest.raises(ValidationError):
+            _settings(retrieval_mode="not-a-mode")

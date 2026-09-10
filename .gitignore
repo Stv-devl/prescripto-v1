@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# Notes locales, jamais versionnées
+note-modification-a-faire.md
+
 # Python
 __pycache__/
 *.pyc
