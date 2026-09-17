@@ -7,10 +7,15 @@ import re
 import uuid
 from collections.abc import AsyncGenerator
 
+from mistralai.models import UsageInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.mistral import mistral_client
+from app.core.mistral import (
+    MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS,
+    mistral_client,
+    mistral_large_limiter,
+)
 from app.models.message import Message
 from app.schemas.chat import Source, StructuredSchema, StructuredTable
 from app.schemas.search import SearchFilters, SearchResult
@@ -48,6 +53,27 @@ _LOCALIZATION_RE = re.compile(
     re.IGNORECASE,
 )
 _NUMBERS_RE = re.compile(r"[\d.,]+\s*(?:m[²³23]?|ml|kg|l)\b")
+
+
+def _usage_leg(usage: UsageInfo | None) -> dict[str, int | float]:
+    """Token counts and USD cost for one Mistral call, zeroed if none was made."""
+    input_tokens = usage.prompt_tokens or 0 if usage else 0
+    output_tokens = usage.completion_tokens or 0 if usage else 0
+    price = MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
+    cost_usd = (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd}
+
+
+def _usage_event(rewrite: UsageInfo | None, generation: UsageInfo | None) -> dict[str, object]:
+    """Build the {rewrite, generation, total} usage payload for the SSE stream."""
+    rewrite_leg = _usage_leg(rewrite)
+    generation_leg = _usage_leg(generation)
+    total = {
+        "input_tokens": rewrite_leg["input_tokens"] + generation_leg["input_tokens"],
+        "output_tokens": rewrite_leg["output_tokens"] + generation_leg["output_tokens"],
+        "cost_usd": rewrite_leg["cost_usd"] + generation_leg["cost_usd"],
+    }
+    return {"rewrite": rewrite_leg, "generation": generation_leg, "total": total}
 
 
 def _normalize_for_dedup(text: str) -> str:
@@ -165,8 +191,9 @@ async def chat_stream(
     recent_messages = list(reversed(list(result.scalars().all())))
 
     history_for_rewrite = recent_messages[:-1]
+    rewrite_usage: list[UsageInfo] = []
     search_query, related_queries, _llm_scope, structured, schema_flag = await rewrite_query(
-        question, history_for_rewrite
+        question, history_for_rewrite, usage_sink=rewrite_usage
     )
 
     scope = classify_scope(question)
@@ -256,7 +283,9 @@ async def chat_stream(
         )
 
     full_response = ""
+    generation_usage: UsageInfo | None = None
 
+    await mistral_large_limiter.wait()
     stream = await mistral_client.chat.stream_async(
         model="mistral-large-latest",
         messages=mistral_messages,
@@ -268,6 +297,8 @@ async def chat_stream(
         if token:
             full_response += token
             yield f"data: {json.dumps({'text': token})}\n\n"
+        if event.data.usage is not None:
+            generation_usage = event.data.usage
 
     table: StructuredTable | None = None
     if table_task is not None:
@@ -309,6 +340,8 @@ async def chat_stream(
     db.add(assistant_msg)
     await db.commit()
 
+    rewrite_call_usage = rewrite_usage[0] if rewrite_usage else None
+    yield f"data: {json.dumps({'usage': _usage_event(rewrite_call_usage, generation_usage)})}\n\n"
     yield "data: [DONE]\n\n"
 
 
