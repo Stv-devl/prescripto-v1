@@ -5,7 +5,7 @@ import logging
 import re
 import uuid
 
-from app.core.mistral import mistral_client
+from app.core.mistral import mistral_client, mistral_large_limiter
 from app.schemas.chat import StructuredSchema
 from app.schemas.search import SearchFilters
 from app.services import search as search_service
@@ -71,6 +71,7 @@ async def extract_schema(
 ) -> StructuredSchema | None:
     """Extract a parametric schema description from context via Mistral Large."""
     try:
+        await mistral_large_limiter.wait()
         response = await mistral_client.chat.complete_async(
             model="mistral-large-latest",
             messages=[

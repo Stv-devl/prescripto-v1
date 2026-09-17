@@ -4,7 +4,9 @@ import json
 import logging
 import re
 
-from app.core.mistral import mistral_client
+from mistralai.models import UsageInfo
+
+from app.core.mistral import mistral_client, mistral_large_limiter
 from app.models.message import Message
 from app.services.chat.prompts import OFF_TOPIC, REWRITE_PROMPT
 
@@ -14,15 +16,12 @@ logger = logging.getLogger(__name__)
 async def rewrite_query(
     question: str,
     history: list[Message],
+    usage_sink: list[UsageInfo] | None = None,
 ) -> tuple[str | None, list[str], str, str, str]:
     """Rewrite a user question into an optimized search query.
 
-    Returns (query, related, scope, structured, schema) where:
-    - query is None if the question is off-topic
-    - related is a list of 0-2 adjacent concept queries
-    - scope is "broad" or "specific"
-    - structured is "table" or "none"
-    - schema is "schema" or "none"
+    Returns (query, related, scope, structured, schema); query is None if
+    off-topic. usage_sink, when given, receives the call's token usage.
     """
     messages: list[dict[str, str]] = [{"role": "system", "content": REWRITE_PROMPT}]
 
@@ -32,12 +31,15 @@ async def rewrite_query(
     messages.append({"role": "user", "content": question})
 
     try:
+        await mistral_large_limiter.wait()
         response = await mistral_client.chat.complete_async(
             model="mistral-large-latest",
             messages=messages,
             temperature=0.0,
             max_tokens=300,
         )
+        if usage_sink is not None:
+            usage_sink.append(response.usage)
         rewritten = response.choices[0].message.content  # type: ignore[union-attr]
         if rewritten and rewritten.strip():
             cleaned = rewritten.strip()

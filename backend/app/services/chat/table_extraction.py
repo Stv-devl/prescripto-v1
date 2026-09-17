@@ -5,7 +5,7 @@ import logging
 import re
 import unicodedata
 
-from app.core.mistral import mistral_client
+from app.core.mistral import mistral_client, mistral_large_limiter
 from app.schemas.chat import StructuredTable
 from app.services.chat.prompts import TABLE_EXTRACTION_PROMPT
 
@@ -135,6 +135,7 @@ async def extract_table(
             if line.startswith("[") and ", p." in line:
                 logger.debug(f"[TABLE DEBUG]   chunk {i}: {line[:120]}")
 
+        await mistral_large_limiter.wait()
         response = await mistral_client.chat.complete_async(
             model="mistral-large-latest",
             messages=[
