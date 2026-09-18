@@ -25,6 +25,9 @@ _BASE = {
     "forwarded_allow_ips": "10.0.0.0/8",
     # Same reasoning, for the Qdrant Cloud key validator.
     "qdrant_api_key": "test-qdrant-key-never-called",
+    # Same reasoning, for the LangSmith tracing validator (langsmith_tracing
+    # defaults to true, cf. TestLangSmithTracing below).
+    "langsmith_api_key": "test-langsmith-key-never-called",
 }
 
 
@@ -182,6 +185,40 @@ class TestDeployedRefusesAnUnusableRateLimitKey:
     def test_local_never_refuses(self) -> None:
         """A developer runs without a proxy at all; the key is already the client."""
         assert _settings(environment="local", forwarded_allow_ips="").environment == "local"
+
+
+class TestLangSmithTracing:
+    """langsmith_tracing defaults to true (J1: active everywhere, including AWS)."""
+
+    def test_tracing_defaults_to_true(self) -> None:
+        assert _settings().langsmith_tracing is True
+
+    def test_deployed_without_a_key_refuses_and_names_itself(self) -> None:
+        with pytest.raises(ValidationError) as refusal:
+            _settings(environment="production", langsmith_api_key="")
+
+        assert "LANGSMITH_API_KEY" in str(refusal.value)
+
+    def test_deployed_with_a_whitespace_only_key_refuses_too(self) -> None:
+        """A blank-but-non-empty value (e.g. a templating bug) is truthy in
+        Python — the check must strip before judging it present."""
+        with pytest.raises(ValidationError):
+            _settings(environment="production", langsmith_api_key="   ")
+
+    def test_deployed_with_a_key_starts(self) -> None:
+        s = _settings(environment="production", langsmith_api_key="a-real-key")
+
+        assert s.langsmith_api_key == "a-real-key"
+
+    def test_deployed_with_tracing_disabled_does_not_require_a_key(self) -> None:
+        s = _settings(environment="production", langsmith_tracing=False, langsmith_api_key="")
+
+        assert s.langsmith_tracing is False
+
+    def test_local_never_refuses_even_without_a_key(self) -> None:
+        s = _settings(environment="local", langsmith_api_key="")
+
+        assert s.environment == "local"
 
 
 class TestRetrievalMode:

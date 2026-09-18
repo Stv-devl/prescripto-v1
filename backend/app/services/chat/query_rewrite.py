@@ -3,19 +3,27 @@
 import json
 import logging
 import re
+from typing import Protocol
 
 from mistralai.models import UsageInfo
 
 from app.core.mistral import mistral_client, mistral_large_limiter
-from app.models.message import Message
 from app.services.chat.prompts import OFF_TOPIC, REWRITE_PROMPT
 
 logger = logging.getLogger(__name__)
 
 
+class HistoryTurn(Protocol):
+    """Structural type: a `Message` row satisfies it, so does a plain object
+    carrying just these two fields — the graph's own history isn't an ORM row."""
+
+    role: str
+    content: str
+
+
 async def rewrite_query(
     question: str,
-    history: list[Message],
+    history: list[HistoryTurn],
     usage_sink: list[UsageInfo] | None = None,
 ) -> tuple[str | None, list[str], str, str, str]:
     """Rewrite a user question into an optimized search query.

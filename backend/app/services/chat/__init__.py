@@ -11,8 +11,8 @@ from app.services.chat.conversation import (
     get_messages,
     list_conversations,
 )
+from app.services.chat.graph import chat_stream
 from app.services.chat.prompts import SYSTEM_PROMPT, get_forced_related
-from app.services.chat.stream import chat_stream
 
 __all__ = [
     "SYSTEM_PROMPT",
