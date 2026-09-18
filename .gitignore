@@ -81,3 +81,6 @@ docs/product/
 .claude/.tdd-red/
 # .claude/.tdd-unfrozen n'est délibérément PAS ignoré : toute la raison d'être de
 # la liste d'exceptions TDD est d'être visible en review (.claude/rules/05-testing.md).
+
+# Vercel project link (machine/account-specific, created by `vercel link`)
+.vercel/
