@@ -49,6 +49,44 @@ def _forget_rate_limits() -> Iterator[None]:
     ratelimit.reset_all()
 
 
+@pytest.fixture(autouse=True)
+def _fast_mistral_limiter() -> Iterator[None]:
+    """Neutralizes the real 0.25 req/s Mistral limiter's sleep in tests.
+
+    It is a process-wide singleton (app/core/mistral.py) shared across the
+    whole session: without this, any test that exercises the real chat
+    pipeline (several calls per case) serializes onto a strict 4s cadence and
+    the suite takes minutes instead of seconds.
+    """
+    from app.core.mistral import mistral_large_limiter
+
+    original_interval = mistral_large_limiter._min_interval
+    mistral_large_limiter._min_interval = 0.0
+    mistral_large_limiter._next_slot = 0.0
+    yield
+    mistral_large_limiter._min_interval = original_interval
+
+
+@pytest.fixture(autouse=True)
+def _clean_langsmith_env() -> Iterator[None]:
+    """Undoes configure_langsmith()'s env writes around every case.
+
+    `Settings()` reads LANGSMITH_TRACING/LANGSMITH_API_KEY/LANGSMITH_PROJECT/
+    LANGSMITH_ENDPOINT from the environment by field-name convention, same as
+    every other field. `configure_langsmith()` (called once at `graph.py`
+    import, and directly by its own tests) writes those exact names back from
+    a `Settings` instance — left in place, a bare `Settings()` built later
+    would silently pick up whatever an earlier import or case wrote, instead
+    of the field's own default.
+    """
+    _vars = ("LANGSMITH_TRACING", "LANGSMITH_API_KEY", "LANGSMITH_PROJECT", "LANGSMITH_ENDPOINT")
+    for var in _vars:
+        os.environ.pop(var, None)
+    yield
+    for var in _vars:
+        os.environ.pop(var, None)
+
+
 @pytest.fixture
 def tenant_id() -> uuid.UUID:
     """A fixed tenant ID for tests."""

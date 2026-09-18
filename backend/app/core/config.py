@@ -116,6 +116,24 @@ class Settings(BaseSettings):
     api_url: str = "https://api.prescripto.fr"
     cors_origins: list[str] = ["https://prescripto.fr", "http://localhost:5173"]
 
+    langsmith_tracing: bool = Field(
+        default=True,
+        description="Active partout, y compris production (J1) — voir langsmith_api_key.",
+    )
+    langsmith_api_key: str = Field(
+        default="",
+        description="Required when langsmith_tracing is true outside local (enforced below).",
+    )
+    langsmith_project: str = "prescripto"
+    langsmith_endpoint: str = Field(
+        default="https://eu.api.smith.langchain.com",
+        description=(
+            "This workspace is EU-hosted (confirmed 2026-09-18) — the SDK's "
+            "own default (api.smith.langchain.com) is US-only and 403s a "
+            "valid key/project pair silently."
+        ),
+    )
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     @property
@@ -148,6 +166,12 @@ class Settings(BaseSettings):
             )
         if not self.cors_origins or "*" in self.cors_origins:
             raise ValueError(f"CORS_ORIGINS must be an explicit list in {self.environment}")
+        if self.langsmith_tracing and not self.langsmith_api_key.strip():
+            raise ValueError(
+                f"LANGSMITH_API_KEY is required in {self.environment} when "
+                "LANGSMITH_TRACING is true: tracing would silently fail at the first "
+                "real call, not at boot"
+            )
         return self
 
     @model_validator(mode="after")
