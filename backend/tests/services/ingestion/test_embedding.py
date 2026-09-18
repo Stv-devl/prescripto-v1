@@ -164,7 +164,16 @@ class TestEnsureCollectionPayloadIndexes:
         with patch("app.services.ingestion.embedding.qdrant_client", store):
             await ensure_collection()
 
-        assert store.created_indexes == ["tenant_id", "project_id"]
+        assert store.created_indexes == [
+            "tenant_id",
+            "project_id",
+            "type",
+            "lot",
+            "phase",
+            "content_type",
+            "document_id",
+            "filename",
+        ]
 
     async def test_a_second_call_does_not_raise(self) -> None:
         """`ensure_collection` runs on every app startup: an index already
@@ -177,7 +186,16 @@ class TestEnsureCollectionPayloadIndexes:
             await ensure_collection()
             await ensure_collection()
 
-        assert store.created_indexes == ["tenant_id", "project_id"]
+        assert store.created_indexes == [
+            "tenant_id",
+            "project_id",
+            "type",
+            "lot",
+            "phase",
+            "content_type",
+            "document_id",
+            "filename",
+        ]
 
     async def test_a_genuinely_different_failure_propagates(self) -> None:
         """"Already exists" is not the only `UnexpectedResponse` Qdrant can
