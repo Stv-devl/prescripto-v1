@@ -23,6 +23,8 @@ _BASE = {
     # Every deployed case below would otherwise fail the rate-limit validator
     # before reaching its own assertion. Its own cases override it.
     "forwarded_allow_ips": "10.0.0.0/8",
+    # Same reasoning, for the Qdrant Cloud key validator.
+    "qdrant_api_key": "test-qdrant-key-never-called",
 }
 
 
@@ -70,9 +72,7 @@ class TestAdminEmailsSurvivesAnEmptyVariable:
 
         assert effective_admin_emails(s) == frozenset()
 
-    def test_an_absent_variable_grants_nobody_when_deployed(
-        self, monkeypatch: object
-    ) -> None:
+    def test_an_absent_variable_grants_nobody_when_deployed(self, monkeypatch: object) -> None:
         # Passed as a keyword, not cleared from the environment: Settings also
         # reads backend/.env, which delenv cannot reach, so a developer whose
         # own file names an operator turned this case red for a reason that had
@@ -170,9 +170,7 @@ class TestDeployedRefusesAnUnusableRateLimitKey:
             _settings(environment="production", forwarded_allow_ips="traefik")
 
     def test_a_list_of_networks_starts(self) -> None:
-        s = _settings(
-            environment="production", forwarded_allow_ips="172.18.0.0/16, 10.0.0.1"
-        )
+        s = _settings(environment="production", forwarded_allow_ips="172.18.0.0/16, 10.0.0.1")
 
         assert s.forwarded_allow_ips == "172.18.0.0/16, 10.0.0.1"
 

@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     )
 
     qdrant_url: str = "http://localhost:6333"
+    qdrant_api_key: str = Field(
+        default="",
+        description="Required by Qdrant Cloud; the local docker-compose instance has no auth.",
+    )
 
     retrieval_mode: Literal["baseline", "v1"] = Field(
         default="baseline",
@@ -136,6 +140,12 @@ class Settings(BaseSettings):
             return self
         if "localhost" in self.database_url:
             raise ValueError(f"DATABASE_URL still points at localhost in {self.environment}")
+        if not self.qdrant_api_key:
+            raise ValueError(
+                f"QDRANT_API_KEY is required in {self.environment}: Qdrant Cloud rejects "
+                "unauthenticated requests, and a missing key would only fail at the first "
+                "real search, not at boot"
+            )
         if not self.cors_origins or "*" in self.cors_origins:
             raise ValueError(f"CORS_ORIGINS must be an explicit list in {self.environment}")
         return self
