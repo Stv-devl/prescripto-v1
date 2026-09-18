@@ -26,7 +26,16 @@ EMBEDDING_MODEL = "mistral-embed"
 VECTOR_SIZE = 1024
 BATCH_SIZE = 10
 
-INDEXED_PAYLOAD_FIELDS = ("tenant_id", "project_id")
+INDEXED_PAYLOAD_FIELDS = (
+    "tenant_id",
+    "project_id",
+    "type",
+    "lot",
+    "phase",
+    "content_type",
+    "document_id",
+    "filename",
+)
 
 _EMBED_MAX_RETRIES = 3
 _EMBED_RETRY_BASE_DELAY = 1.0
@@ -59,9 +68,11 @@ async def ensure_collection() -> None:
 async def _ensure_payload_index(field_name: str) -> None:
     """Create a keyword payload index on `field_name`.
 
-    `tenant_id` and `project_id` are stored as UUID strings (`qdrant_payload.py`)
-    and matched everywhere with `MatchValue`, so a keyword index serves every
-    existing filter with no query change. No try/except here: real Qdrant is
+    Every field in `INDEXED_PAYLOAD_FIELDS` — UUID strings (`tenant_id`,
+    `project_id`, `document_id`) and plain strings (`type`, `lot`, `phase`,
+    `content_type`, `filename`) alike — is matched everywhere with
+    `MatchValue`, so a keyword index serves every existing filter with no
+    query change. No try/except here: real Qdrant is
     already idempotent for this call, and any error it does raise here — auth
     rejected, a malformed field name, the server unreachable — is a genuine
     startup failure that must propagate, not be silently swallowed into an

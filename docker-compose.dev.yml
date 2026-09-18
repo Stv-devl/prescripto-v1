@@ -18,7 +18,7 @@ services:
       retries: 5
 
   qdrant:
-    image: qdrant/qdrant:v1.13.2
+    image: qdrant/qdrant:v1.19.1
     container_name: prescripto-qdrant
     restart: unless-stopped
     ports:
@@ -27,7 +27,14 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:6333/healthz || exit 1"]
+      # qdrant/qdrant ships neither curl nor wget — bash's /dev/tcp is the only
+      # HTTP-capable check available inside the image. CMD-SHELL defaults to
+      # /bin/sh (dash here), which lacks /dev/tcp, so bash must be invoked explicitly.
+      # `Connection: close` makes the server close the socket once it has sent
+      # the response, so `cat` reaches EOF on its own — reading to completion
+      # instead of a fixed byte count means no assumption about the exact
+      # length or position of the status line.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/6333 && printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
       interval: 5s
       timeout: 5s
       retries: 5
