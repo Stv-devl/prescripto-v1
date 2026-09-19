@@ -17,6 +17,14 @@ class FakePoint:
     id: str
     payload: dict[str, object]
     score: float = 0.9
+    vector: object | None = None
+
+
+@dataclass
+class FakeQueryResponse:
+    """What `query_points()` returns — only `.points` is read."""
+
+    points: list[FakePoint]
 
 
 @dataclass
@@ -128,6 +136,68 @@ class FakeQdrant:
         ordered = sorted(above, key=lambda pair: pair[0], reverse=True)[:limit]
         return [replace(point, score=score) for score, point in ordered]
 
+    async def query_points(
+        self,
+        *,
+        collection_name: str,
+        prefetch: list[object] | None = None,
+        query: object = None,
+        query_filter: object = None,
+        limit: int = 10,
+        score_threshold: float | None = None,
+    ) -> FakeQueryResponse:
+        """Hybrid query the way Qdrant 1.19.1 answers it, measured on 2026-09-19.
+
+        Each prefetch applies its own filter; a dense prefetch ranks by the point's
+        `score` above its own `score_threshold`; a sparse prefetch ranks by how many
+        indices the point's text shares with the query. Fusion is RRF,
+        `sum(1 / (2 + rank))` with a 0-based rank and no normalisation — two
+        branches ranking one point first give 1.0, a second place on one branch
+        gives 0.3333. The outer filter and threshold apply to the fused result.
+        """
+        from app.services.sparse import document_sparse_vector
+
+        round_scores = (
+            self._score_rounds[self.search_calls]
+            if self.search_calls < len(self._score_rounds)
+            else {}
+        )
+        self.search_calls += 1
+
+        fused: dict[str, float] = {}
+        by_id: dict[str, FakePoint] = {}
+        for branch in prefetch or []:
+            candidates = [p for p in self.points if self._matches(p, branch.filter)]
+            if branch.using == "sparse":
+                query_indices = set(branch.query.indices)
+                overlaps = [
+                    (
+                        len(
+                            query_indices
+                            & set(document_sparse_vector(str(p.payload.get("text", ""))).indices)
+                        ),
+                        p,
+                    )
+                    for p in candidates
+                ]
+                ranked = [p for n, p in sorted(overlaps, key=lambda pair: -pair[0]) if n > 0]
+            else:
+                floor = branch.score_threshold if branch.score_threshold is not None else 0.0
+                scored = [(round_scores.get(str(p.id), p.score), p) for p in candidates]
+                ranked = [p for s, p in sorted(scored, key=lambda pair: -pair[0]) if s >= floor]
+            for rank, point in enumerate(ranked[: branch.limit]):
+                fused[str(point.id)] = fused.get(str(point.id), 0.0) + 1 / (2 + rank)
+                by_id[str(point.id)] = point
+
+        floor = score_threshold if score_threshold is not None else 0.0
+        outer = [
+            (score, by_id[pid])
+            for pid, score in fused.items()
+            if score >= floor and self._matches(by_id[pid], query_filter)
+        ]
+        ordered = sorted(outer, key=lambda pair: -pair[0])[:limit]
+        return FakeQueryResponse(points=[replace(p, score=s) for s, p in ordered])
+
     async def delete(self, *, collection_name: str, points_selector: object = None) -> None:
         """Delete by filter, or by a bare list of point ids.
 
@@ -152,7 +222,9 @@ class FakeQdrant:
             point_id = str(getattr(point, "id", ""))
             payload = getattr(point, "payload", None) or {}
             self.points = [p for p in self.points if str(p.id) != point_id]
-            self.points.append(FakePoint(id=point_id, payload=dict(payload)))
+            self.points.append(
+                FakePoint(id=point_id, payload=dict(payload), vector=getattr(point, "vector", None))
+            )
 
     async def get_collections(self) -> "FakeCollections":
         """What `ensure_collection` reads before indexing.
@@ -162,7 +234,13 @@ class FakeQdrant:
         """
         return FakeCollections(collections=[FakeCollection(name="documents")])
 
-    async def create_collection(self, *, collection_name: str, vectors_config: object) -> None:
+    async def create_collection(
+        self,
+        *,
+        collection_name: str,
+        vectors_config: object,
+        sparse_vectors_config: object = None,
+    ) -> None:
         """Unreachable while `get_collections` reports the collection present.
 
         Kept so the double's shape matches the real client's, in case a future

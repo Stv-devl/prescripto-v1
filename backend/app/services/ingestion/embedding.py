@@ -5,7 +5,14 @@ import logging
 import uuid
 from datetime import datetime
 
-from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    Modifier,
+    PayloadSchemaType,
+    PointStruct,
+    SparseVectorParams,
+    VectorParams,
+)
 
 from app.core.config import settings
 from app.core.mistral import mistral_client
@@ -55,10 +62,17 @@ async def ensure_collection() -> None:
     collections = await qdrant_client.get_collections()
     existing = [c.name for c in collections.collections]
     if COLLECTION_NAME not in existing:
-        await qdrant_client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
-        )
+        dense = VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE)
+        if settings.retrieval_mode == "v1":
+            await qdrant_client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config={"dense": dense},
+                sparse_vectors_config={"sparse": SparseVectorParams(modifier=Modifier.IDF)},
+            )
+        else:
+            await qdrant_client.create_collection(
+                collection_name=COLLECTION_NAME, vectors_config=dense
+            )
         logger.info("Created Qdrant collection '%s'", COLLECTION_NAME)
 
     for field_name in INDEXED_PAYLOAD_FIELDS:

@@ -33,13 +33,23 @@ async def _search_compat(
     condition lives, so a silently-swallowed keyword there is the silent
     cross-tenant leak `06-database.md` warns about, not just a crash.
     """
-    response = await self.query_points(
-        collection_name=collection_name,
-        query=query_vector,
-        query_filter=query_filter,
-        limit=limit,
-        score_threshold=score_threshold,
-    )
+    if settings.retrieval_mode == "v1":
+        response = await self.query_points(
+            collection_name=collection_name,
+            query=query_vector,
+            query_filter=query_filter,
+            limit=limit,
+            score_threshold=score_threshold,
+            using="dense",
+        )
+    else:
+        response = await self.query_points(
+            collection_name=collection_name,
+            query=query_vector,
+            query_filter=query_filter,
+            limit=limit,
+            score_threshold=score_threshold,
+        )
     return response.points
 
 

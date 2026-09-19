@@ -203,9 +203,10 @@ def _build_context_and_sources(
     """Build context string grouped by lot and deduplicated source list."""
     seen_texts: set[str] = set()
     valid_chunks: list[SearchResult] = []
+    cutoff = search_service.context_score_threshold(score_threshold)
 
     for sr in search_results:
-        if sr.score < score_threshold and sr.type != "DPGF":
+        if sr.score < cutoff and sr.type != "DPGF":
             continue
         text_key = sr.text[:200]
         if text_key in seen_texts:
