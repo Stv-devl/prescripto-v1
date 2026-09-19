@@ -231,8 +231,8 @@ class TestRewriteQueryGuard:
         await rewrite_query(NORMATIVE_QUESTION, [])
         assert not _has_error_record(caplog)
         assert _has_guard_record(caplog)
-        info_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-        assert not any("maçonneries" in message for message in info_messages)
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("maçonneries" in message for message in messages)
 
     async def test_v1_off_topic_reply_with_extra_text_still_guarded(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
