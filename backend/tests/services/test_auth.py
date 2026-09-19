@@ -213,28 +213,38 @@ class TestChangePasswordRevokesRefreshTokens:
 
         assert user.token_version == 1
 
-    async def test_reset_password_increments_token_version(self) -> None:
+    async def test_reset_password_increments_token_version(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.core.auth import ResetClaims
         from app.services.auth import reset_password
 
-        user = _make_user(token_version=0)
-        db = _make_db(scalar_result=user)
+        user = await _real_user(db, tenant_a)
 
         with (
-            patch("app.services.auth.decode_reset_token", return_value=user.id),
+            patch(
+                "app.services.auth.decode_reset_token",
+                return_value=ResetClaims(user.id, user.token_version),
+            ),
             patch("app.services.auth.hash_password", return_value="new_hashed_password"),
         ):
             await reset_password(db, "reset_tok", "new_password456")
 
         assert user.token_version == 1
 
-    async def test_refresh_rejected_for_token_issued_before_reset_password(self) -> None:
+    async def test_refresh_rejected_for_token_issued_before_reset_password(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.core.auth import ResetClaims
         from app.services.auth import reset_password
 
-        user = _make_user(token_version=0)
-        db = _make_db(scalar_result=user)
+        user = await _real_user(db, tenant_a)
 
         with (
-            patch("app.services.auth.decode_reset_token", return_value=user.id),
+            patch(
+                "app.services.auth.decode_reset_token",
+                return_value=ResetClaims(user.id, user.token_version),
+            ),
             patch("app.services.auth.hash_password", return_value="new_hashed_password"),
         ):
             await reset_password(db, "reset_tok", "new_password456")
@@ -327,12 +337,16 @@ class TestVerifyAccessTokenVersion:
     async def test_access_token_issued_before_reset_password_is_refused(
         self, db: object, tenant_a: object
     ) -> None:
+        from app.core.auth import ResetClaims
         from app.services.auth import reset_password, verify_access_token_version
 
         user = await _real_user(db, tenant_a)
 
         with (
-            patch("app.services.auth.decode_reset_token", return_value=user.id),
+            patch(
+                "app.services.auth.decode_reset_token",
+                return_value=ResetClaims(user.id, user.token_version),
+            ),
             patch("app.services.auth.hash_password", return_value="new_hashed_password"),
         ):
             await reset_password(db, "reset_tok", "new_password456")
@@ -885,7 +899,7 @@ class TestPasswordWorkLeavesTheEventLoop:
         other = _once_password_work_is_in_flight(order, started, released)
 
         user = await _user_with_role(db, tenant_a, "eco@cabinet.fr", "owner")
-        token = create_reset_token(user.id)
+        token = create_reset_token(user.id, user.token_version)
 
         with patch("app.services.auth.hash_password", _blocking(order, started, released,"hashed")):
             await asyncio.gather(reset_password(db, token, "nouveaumotdepasse1"), other)
@@ -938,3 +952,255 @@ class TestPasswordWorkLeavesTheEventLoop:
                 )
 
         assert order == ["other coroutine", "password work"]
+
+
+_REFUSAL = "^invalid reset token$"
+
+
+def _reset_payload(user_id: uuid.UUID, token_version: object) -> dict[str, object]:
+    """A valid reset-token payload; a case varies exactly one claim of it."""
+    from datetime import UTC, datetime, timedelta
+
+    return {
+        "sub": str(user_id),
+        "exp": datetime.now(UTC) + timedelta(minutes=30),
+        "type": "reset",
+        "token_version": token_version,
+    }
+
+
+def _forge(payload: dict[str, object]) -> str:
+    from jose import jwt
+
+    from app.core.config import settings
+
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+
+
+class TestResetTokenIsSingleUse:
+    async def test_a_reset_token_is_refused_the_second_time_and_the_first_password_stays(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.core.auth import create_reset_token, verify_password
+        from app.services.auth import reset_password
+
+        user = await _real_user(db, tenant_a)
+        token = create_reset_token(user.id, 0)
+
+        await reset_password(db, token, "first-password-1")
+        with pytest.raises(UnauthorizedError, match=_REFUSAL):
+            await reset_password(db, token, "second-password-2")
+
+        await db.refresh(user)
+        assert verify_password("first-password-1", user.hashed_password) is True
+        assert user.token_version == 1
+
+    async def test_a_token_issued_before_change_password_is_refused_after_it(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.core.auth import create_reset_token, verify_password
+        from app.services.auth import change_password, reset_password
+
+        user = await _real_user(db, tenant_a)
+        token = create_reset_token(user.id, 0)
+
+        with patch("app.services.auth.verify_password", return_value=True):
+            await change_password(db, user.id, "whatever", "changed-password-1")
+
+        with pytest.raises(UnauthorizedError, match=_REFUSAL):
+            await reset_password(db, token, "reset-password-2")
+
+        await db.refresh(user)
+        assert verify_password("changed-password-1", user.hashed_password) is True
+
+    async def test_a_token_whose_version_differs_from_the_stored_one_is_refused(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.core.auth import create_reset_token
+        from app.services.auth import reset_password
+
+        user = await _real_user(db, tenant_a, token_version=2)
+        token = create_reset_token(user.id, 1)
+
+        with pytest.raises(UnauthorizedError, match=_REFUSAL):
+            await reset_password(db, token, "reset-password-2")
+
+        await db.refresh(user)
+        assert user.hashed_password == "not-a-real-hash"
+        assert user.token_version == 2
+
+    async def test_a_token_from_forgot_password_resets_once_for_a_user_at_version_3(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from urllib.parse import parse_qs, urlparse
+
+        from app.core.auth import verify_password
+        from app.services.auth import forgot_password, reset_password
+
+        user = await _real_user(db, tenant_a, token_version=3)
+
+        with patch("app.services.auth.send_reset_email", new_callable=AsyncMock) as send:
+            await forgot_password(db, user.email)
+
+        reset_url = send.await_args.args[1]
+        token = parse_qs(urlparse(reset_url).query)["token"][0]
+
+        await reset_password(db, token, "brand-new-password-1")
+
+        await db.refresh(user)
+        assert verify_password("brand-new-password-1", user.hashed_password) is True
+        assert user.token_version == 4
+
+    async def test_a_token_for_one_account_never_changes_another_account(
+        self, db: object, tenant_a: object, tenant_b: object
+    ) -> None:
+        from app.core.auth import create_reset_token, verify_password
+        from app.services.auth import reset_password
+
+        target = await _user_with_role(db, tenant_a, "target@cabinet.fr", "owner")
+        other = await _user_with_role(db, tenant_b, "other@cabinet.fr", "owner")
+        token = create_reset_token(target.id, 0)
+
+        await reset_password(db, token, "target-new-password-1")
+
+        await db.refresh(target)
+        await db.refresh(other)
+        assert verify_password("target-new-password-1", target.hashed_password) is True
+        assert other.hashed_password == "not-a-real-hash"
+        assert other.token_version == 0
+
+    async def test_a_token_without_a_token_version_claim_is_refused(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.services.auth import reset_password
+
+        user = await _real_user(db, tenant_a)
+        payload = _reset_payload(user.id, 0)
+        del payload["token_version"]
+
+        with pytest.raises(UnauthorizedError, match=_REFUSAL):
+            await reset_password(db, _forge(payload), "reset-password-2")
+
+    async def test_a_token_whose_version_claim_is_the_string_zero_is_refused(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.services.auth import reset_password
+
+        user = await _real_user(db, tenant_a)
+
+        with pytest.raises(UnauthorizedError, match=_REFUSAL):
+            await reset_password(db, _forge(_reset_payload(user.id, "0")), "reset-password-2")
+
+    async def test_a_token_whose_version_claim_is_the_float_zero_is_refused_at_stored_zero(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.services.auth import reset_password
+
+        user = await _real_user(db, tenant_a, token_version=0)
+
+        with pytest.raises(UnauthorizedError, match=_REFUSAL):
+            await reset_password(db, _forge(_reset_payload(user.id, 0.0)), "reset-password-2")
+
+    async def test_a_token_whose_version_claim_is_true_is_refused_at_stored_one(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.services.auth import reset_password
+
+        user = await _real_user(db, tenant_a, token_version=1)
+
+        with pytest.raises(UnauthorizedError, match=_REFUSAL):
+            await reset_password(db, _forge(_reset_payload(user.id, True)), "reset-password-2")
+
+    async def test_a_token_whose_sub_is_not_a_uuid_is_refused(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.services.auth import reset_password
+
+        user = await _real_user(db, tenant_a)
+        payload = _reset_payload(user.id, 0)
+        payload["sub"] = "not-a-uuid"
+
+        with pytest.raises(UnauthorizedError, match=_REFUSAL):
+            await reset_password(db, _forge(payload), "reset-password-2")
+
+    async def test_a_token_whose_sub_is_an_integer_stays_refused(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from app.services.auth import reset_password
+
+        user = await _real_user(db, tenant_a)
+        payload = _reset_payload(user.id, 0)
+        payload["sub"] = 12345
+
+        with pytest.raises(UnauthorizedError, match=_REFUSAL):
+            await reset_password(db, _forge(payload), "reset-password-2")
+
+    async def test_a_valid_token_for_a_vanished_user_is_refused_like_a_stale_one_and_creates_nothing(
+        self, db: object, tenant_a: object
+    ) -> None:
+        from sqlalchemy import func, select
+
+        from app.core.auth import create_reset_token
+        from app.models.user import User
+        from app.services.auth import reset_password
+
+        token = create_reset_token(uuid.uuid4(), 0)
+
+        with pytest.raises(UnauthorizedError, match=_REFUSAL) as vanished:
+            await reset_password(db, token, "reset-password-2")
+
+        stale_user = await _real_user(db, tenant_a, token_version=2)
+        with pytest.raises(UnauthorizedError, match=_REFUSAL) as stale:
+            await reset_password(db, create_reset_token(stale_user.id, 1), "reset-password-2")
+
+        assert type(vanished.value) is type(stale.value)
+        assert vanished.value.message == stale.value.message == "invalid reset token"
+        count = await db.execute(select(func.count()).select_from(User))
+        assert count.scalar_one() == 1
+
+
+class TestResetTokenSingleUseUnderConcurrency:
+    async def test_the_same_token_presented_twice_concurrently_succeeds_exactly_once(
+        self, db: object, tenant_a: object
+    ) -> None:
+        import asyncio
+        import threading
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from app.core.auth import create_reset_token
+        from app.services.auth import reset_password
+
+        user = await _real_user(db, tenant_a)
+        token = create_reset_token(user.id, 0)
+
+        barrier = threading.Barrier(2, timeout=5)
+        lock = threading.Lock()
+        counter = [0]
+
+        def double(*_args: object, **_kwargs: object) -> str:
+            with lock:
+                counter[0] += 1
+                number = counter[0]
+            barrier.wait()
+            return f"hash-{number}"
+
+        sf = async_sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+        async with sf() as s1, sf() as s2:
+            with patch("app.services.auth.hash_password", double):
+                outcomes = await asyncio.gather(
+                    reset_password(s1, token, "concurrent-password-1"),
+                    reset_password(s2, token, "concurrent-password-2"),
+                    return_exceptions=True,
+                )
+
+        failures = [o for o in outcomes if isinstance(o, BaseException)]
+        successes = [o for o in outcomes if not isinstance(o, BaseException)]
+        assert len(successes) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], UnauthorizedError)
+        assert failures[0].message == "invalid reset token"
+
+        await db.refresh(user)
+        assert user.token_version == 1
+        assert user.hashed_password in {"hash-1", "hash-2"}

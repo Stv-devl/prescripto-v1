@@ -5,7 +5,7 @@ import logging
 import uuid
 from typing import NamedTuple
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import (
@@ -143,23 +143,30 @@ async def forgot_password(db: AsyncSession, email: str) -> None:
     user = result.scalar_one_or_none()
 
     if user is not None:
-        token = create_reset_token(user.id)
+        token = create_reset_token(user.id, user.token_version)
         reset_url = f"{settings.app_url}/reset-password?token={token}"
         await send_reset_email(email, reset_url)
 
 
 async def reset_password(db: AsyncSession, token: str, new_password: str) -> None:
-    """Validate a reset token and update the user's password."""
-    user_id = decode_reset_token(token)
+    """Validate a reset token and update the user's password, once.
 
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
+    The token vouches for one `token_version`; the write only lands while the row
+    still carries it and moves it forward in the same statement, so a second use
+    (or a concurrent one) matches no row and is refused.
+    """
+    claims = decode_reset_token(token)
+    hashed = await asyncio.to_thread(hash_password, new_password)
 
-    if user is None:
+    result = await db.execute(
+        update(User)
+        .where(User.id == claims.user_id, User.token_version == claims.token_version)
+        .values(hashed_password=hashed, token_version=User.token_version + 1)
+        .returning(User.id)
+    )
+    if result.scalar_one_or_none() is None:
         raise UnauthorizedError("invalid reset token")
 
-    user.hashed_password = await asyncio.to_thread(hash_password, new_password)
-    user.token_version += 1
     await db.commit()
 
 
