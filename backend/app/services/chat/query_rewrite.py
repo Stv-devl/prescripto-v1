@@ -3,14 +3,23 @@
 import json
 import logging
 import re
+from itertools import pairwise
 from typing import Protocol
 
 from mistralai.models import UsageInfo
 
+from app.core.config import settings
 from app.core.mistral import mistral_client, mistral_large_limiter
 from app.services.chat.prompts import OFF_TOPIC, REWRITE_PROMPT
+from app.services.sparse import tokenize
 
 logger = logging.getLogger(__name__)
+
+_NORMATIVE_KEYWORDS = frozenset(
+    {"dtu", "nf", "norme", "normes", "eurocode", "eurocodes", "reglementation", "re2020", "rt2012"}
+)
+_NORMATIVE_YEAR_AFTER = {"re": "2020", "rt": "2012"}
+_REFERENCE_SEPARATORS = re.compile(r"[.,\-/]")
 
 
 class HistoryTurn(Protocol):
@@ -19,6 +28,28 @@ class HistoryTurn(Protocol):
 
     role: str
     content: str
+
+
+def has_normative_reference(question: str) -> bool:
+    """True when the question cites a norm (DTU, NF, EN + number, Eurocode, RE2020...).
+
+    Whole words only, case- and accent-insensitive; the French word "en" alone
+    never counts.
+    """
+    words = [
+        piece
+        for token in tokenize(question)
+        for piece in _REFERENCE_SEPARATORS.split(token)
+        if piece
+    ]
+    for word, following in pairwise([*words, ""]):
+        if word in _NORMATIVE_KEYWORDS:
+            return True
+        if _NORMATIVE_YEAR_AFTER.get(word) == following:
+            return True
+        if word == "en" and following[:1].isdigit():
+            return True
+    return False
 
 
 async def rewrite_query(
@@ -52,6 +83,11 @@ async def rewrite_query(
         if rewritten and rewritten.strip():
             cleaned = rewritten.strip()
             if OFF_TOPIC in cleaned:
+                if settings.retrieval_mode == "v1" and has_normative_reference(question):
+                    logger.info(
+                        "Rewrite guard: off-topic reply overridden for a normative question"
+                    )
+                    return question, [], "specific", "none", "none"
                 logger.debug(f"[SEARCH DEBUG] Off-topic detected: '{question}'")
                 return None, [], "specific", "none", "none"
 
