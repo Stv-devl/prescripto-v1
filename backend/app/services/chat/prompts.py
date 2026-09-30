@@ -365,11 +365,34 @@ _OUVRAGE_NORMES_LINE_V1 = (
 )
 
 
+_ORDER_LINE_BASELINE = (
+    "   ORDRE STRICT en fin de réponse : **Localisation** puis **Normes** — rien après.\n"
+)
+_ORDER_LINE_V1 = (
+    "   ORDRE STRICT en fin de réponse : **Localisation**, puis **Normes** "
+    "UNIQUEMENT s'il y a au moins une norme à citer (règle d) — rien après. "
+    "Une réponse sans bloc Normes est correcte.\n"
+)
+_LOCALISATION_NORMES_BASELINE = "(avant Normes)"
+_LOCALISATION_NORMES_V1 = "(avant le bloc Normes s'il y en a un)"
+
+
 def system_prompt_for(mode: RetrievalMode) -> str:
     """Return the RAG system prompt served in the given retrieval mode."""
     if mode == "v1":
-        return SYSTEM_PROMPT.replace(_NORMES_RULE_BASELINE, _NORMES_RULE_V1)
+        return SYSTEM_PROMPT.replace(_NORMES_RULE_BASELINE, _NORMES_RULE_V1).replace(
+            _ORDER_LINE_BASELINE, _ORDER_LINE_V1
+        )
     return SYSTEM_PROMPT
+
+
+def localisation_instruction_for(mode: RetrievalMode) -> str:
+    """Return the localisation instruction served in the given retrieval mode."""
+    if mode == "v1":
+        return LOCALISATION_INSTRUCTION.replace(
+            _LOCALISATION_NORMES_BASELINE, _LOCALISATION_NORMES_V1
+        )
+    return LOCALISATION_INSTRUCTION
 
 
 def get_ouvrage_instruction(question: str, mode: RetrievalMode = "baseline") -> str:

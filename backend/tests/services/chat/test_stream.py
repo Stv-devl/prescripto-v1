@@ -197,3 +197,83 @@ class TestSystemPromptByMode:
         monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
         v1_content = self._system_content(self.WALL_QUESTION, "specific")
         assert baseline_content != v1_content
+
+
+class TestNormesBlockOptionalAssembled:
+    """In v1 the assembled system message never presents the Normes block as mandatory."""
+
+    import pytest
+
+    BROAD_QUESTION = "Quels sont les lots du projet ?"
+    WALL_QUESTION = "Quelle est la composition du mur extérieur ?"
+    FOUNDATION_QUESTION = "Comment sont réalisées les fondations ?"
+    OLD_ORDER_LINE = "**Localisation** puis **Normes** — rien après"
+    V1_ORDER_LINE = (
+        "   ORDRE STRICT en fin de réponse : **Localisation**, puis **Normes** "
+        "UNIQUEMENT s'il y a au moins une norme à citer (règle d) — rien après. "
+        "Une réponse sans bloc Normes est correcte.\n"
+    )
+    OLD_PARENTHESIS = "(avant Normes)"
+    V1_PARENTHESIS = "(avant le bloc Normes s'il y en a un)"
+
+    @staticmethod
+    def _system_content(question: str, scope: str) -> str:
+        from app.services.chat.stream import _build_mistral_messages
+
+        messages = _build_mistral_messages(
+            context_block="",
+            question=question,
+            recent_messages=[],
+            scope=scope,
+            structured="none",
+            schema_flag="none",
+            sources=[],
+        )
+        return messages[0]["content"]
+
+    def test_v1_foundation_question_drops_the_old_order_line_and_parenthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode neither unconditional mention of the Normes block is served."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.FOUNDATION_QUESTION, "specific")
+        assert self.OLD_ORDER_LINE not in content
+        assert self.OLD_PARENTHESIS not in content
+
+    def test_v1_foundation_question_carries_the_conditional_order_line_and_parenthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode the order line and the localisation parenthesis are conditional."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.FOUNDATION_QUESTION, "specific")
+        assert self.V1_ORDER_LINE in content
+        assert self.V1_PARENTHESIS in content
+
+    def test_v1_wall_question_drops_the_old_order_line_and_parenthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode a question matching an ouvrage pattern is served the same way."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.WALL_QUESTION, "specific")
+        assert self.OLD_ORDER_LINE not in content
+        assert self.OLD_PARENTHESIS not in content
+
+    def test_baseline_foundation_question_keeps_the_old_order_line_and_parenthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In baseline mode both historical mentions are still served."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+        content = self._system_content(self.FOUNDATION_QUESTION, "specific")
+        assert self.OLD_ORDER_LINE in content
+        assert self.OLD_PARENTHESIS in content
+
+    def test_v1_broad_question_carries_the_order_line_and_no_localisation_parenthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode a broad question keeps its exemption and gets no localisation text."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.BROAD_QUESTION, "broad")
+        assert self.V1_ORDER_LINE in content
+        assert "PAS de bloc Localisation ni Normes pour les questions générales" in content
+        assert self.OLD_PARENTHESIS not in content
+        assert self.V1_PARENTHESIS not in content

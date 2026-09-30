@@ -44,12 +44,12 @@ from app.services.chat.prompts import (
     FORCED_SCHEMA_RE,
     FORCED_SCORE_FLOOR,
     HISTORY_WINDOW,
-    LOCALISATION_INSTRUCTION,
     MAX_DISPLAYED_SOURCES,
     MIN_SOURCE_TEXT_LENGTH,
     classify_scope,
     get_forced_related,
     get_ouvrage_instruction,
+    localisation_instruction_for,
     system_prompt_for,
 )
 from app.services.chat.query_rewrite import rewrite_query
@@ -335,7 +335,7 @@ def _build_mistral_messages(
             "3-5 phrases synthétiques, pas de développement par lot/ouvrage."
         )
     else:
-        system_content += LOCALISATION_INSTRUCTION
+        system_content += localisation_instruction_for(settings.retrieval_mode)
     system_content += get_ouvrage_instruction(question, settings.retrieval_mode)
 
     has_table = bool(structured == "table" and context_block)
