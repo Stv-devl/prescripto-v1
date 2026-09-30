@@ -741,3 +741,93 @@ async def test_sources_empty_when_all_chunks_filtered_but_context_stays_non_empt
         select(Message).where(Message.conversation_id == conv_id, Message.role == "assistant")
     )
     assert json.loads(result.scalar_one().sources_json) == []
+
+
+class TestSystemPromptByMode:
+    """The assembled system message follows `settings.retrieval_mode`, read at call time."""
+
+    import pytest
+
+    BROAD_QUESTION = "Quels sont les lots du projet ?"
+    WALL_QUESTION = "Quelle est la composition du mur extérieur ?"
+    FOUNDATION_QUESTION = "Comment sont réalisées les fondations ?"
+
+    @staticmethod
+    def _system_content(question: str, scope: str) -> str:
+        from app.services.chat.graph import _build_mistral_messages
+
+        messages = _build_mistral_messages(
+            context_block="",
+            question=question,
+            recent_messages=[],
+            scope=scope,
+            structured="none",
+            schema_flag="none",
+            sources=[],
+        )
+        return messages[0]["content"]
+
+    def test_baseline_system_message_keeps_the_pre_brick_fingerprint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In baseline mode the three reference questions hash to the historical sha256."""
+        import hashlib
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+        cases = [
+            (
+                "broad",
+                self.BROAD_QUESTION,
+                "749529cff64a1190a7863fcb6479d57c88b83e4a857e5be19420701a2b24ddb3",
+            ),
+            (
+                "specific",
+                self.WALL_QUESTION,
+                "d8ccc061ad696b59d8fe43438dc7cb8eedf01bbcbfeff3723839d7d093a8b525",
+            ),
+            (
+                "specific",
+                self.FOUNDATION_QUESTION,
+                "5d1e603c98ecd1758822d7383cb02e51cfedf2f4f4585fdc290881d645c8122e",
+            ),
+        ]
+        digests = [
+            hashlib.sha256(self._system_content(question, scope).encode("utf-8")).hexdigest()
+            for scope, question, _ in cases
+        ]
+        assert digests == [expected for _, _, expected in cases]
+
+    def test_v1_wall_question_carries_the_norms_rule_and_drops_applicable_norms(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode the wall question gets the sourced-norms rule, not the old request."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.WALL_QUESTION, "specific")
+        assert "écrites dans le contexte ET rattachées à l'ouvrage de la question" in content
+        assert "DTU/NF EN applicables" not in content
+
+    def test_v1_wall_question_carries_new_line_6_and_no_norm_example(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode the wall instruction has the new line 6 and no example norm."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.WALL_QUESTION, "specific")
+        assert "uniquement avec les normes écrites dans le contexte pour cette paroi" in content
+        for example in ("tous les DTU", "20.1", "26.1", "25.41"):
+            assert example not in content
+
+    def test_v1_broad_question_keeps_no_localisation_nor_normes_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode a broad question keeps the general-question exemption."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.BROAD_QUESTION, "broad")
+        assert "PAS de bloc Localisation ni Normes pour les questions générales" in content
+
+    def test_mode_is_read_at_call_time(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two successive calls, baseline then v1, return different system messages."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+        baseline_content = self._system_content(self.WALL_QUESTION, "specific")
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        v1_content = self._system_content(self.WALL_QUESTION, "specific")
+        assert baseline_content != v1_content
