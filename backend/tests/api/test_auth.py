@@ -146,6 +146,22 @@ class TestLoginEndpoint:
         assert res.json()["detail"] == "invalid login credentials"
 
 
+class TestResetPasswordEndpoint:
+    def test_invalid_reset_token_returns_401(self, client: TestClient) -> None:
+        with patch(
+            "app.api.auth.auth_service.reset_password",
+            new_callable=AsyncMock,
+            side_effect=UnauthorizedError("invalid reset token"),
+        ):
+            res = client.post(
+                "/api/auth/reset-password",
+                json={"token": "x", "password": "password123"},
+            )
+
+        assert res.status_code == 401
+        assert res.json() == {"detail": "invalid reset token"}
+
+
 class TestRefreshEndpoint:
     def test_refresh_success(self, client: TestClient) -> None:
         with patch(

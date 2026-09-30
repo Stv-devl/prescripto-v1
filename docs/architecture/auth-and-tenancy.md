@@ -16,10 +16,14 @@ service.
 - Access token: 30 minutes. Refresh token: 7 days. Password-reset token: 30
   minutes.
 - Passwords are hashed with bcrypt (`bcrypt.hashpw` / `bcrypt.checkpw`).
-- Every token carries `sub` (user id), `tenant_id`, `type`
-  (`access` / `refresh` / `reset`), and — for access/refresh — a
-  `token_version` used to invalidate all of a user's tokens at once (e.g. on
-  password change) without a revocation list.
+- Every access/refresh token carries `sub` (user id), `tenant_id`, `type`
+  (`access` / `refresh`) and a `token_version` used to invalidate all of a
+  user's tokens at once (e.g. on password change) without a revocation list.
+- A password-reset token (`type: reset`) carries `sub`, `exp` and `token_version`,
+  but no `tenant_id`. `reset_password` writes only while the row still holds that
+  `token_version` and moves it forward in the same statement, so a reset link works
+  once, and a `change_password` made after it was issued also kills it. A reset
+  token without an integer `token_version` is refused.
 
 ```python
 # backend/app/core/auth.py

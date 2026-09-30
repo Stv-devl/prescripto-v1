@@ -65,6 +65,8 @@ docs/ADAPTATION.md
 docs/archive/
 docs/research-cache/
 docs/product/
+docs/specs/
+docs/work/
 
 # === LoopKit — état de session ===
 # Écrit à l'exécution par les hooks et le status line. Jamais versionné :

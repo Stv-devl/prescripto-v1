@@ -4,11 +4,21 @@ import logging
 import uuid
 from collections import defaultdict
 
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from qdrant_client.models import (
+    FieldCondition,
+    Filter,
+    Fusion,
+    FusionQuery,
+    MatchValue,
+    Prefetch,
+    ScoredPoint,
+)
 
+from app.core.config import settings
 from app.core.qdrant import qdrant_client
 from app.schemas.search import SearchFilters, SearchResult
 from app.services.ingestion.embedding import COLLECTION_NAME, embed_texts
+from app.services.sparse import query_sparse_vector
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +110,65 @@ def _should_penalize(doc_type: str, query: str) -> bool:
     return not any(term in query_lower for term in terms)
 
 
+def context_score_threshold(base: float) -> float:
+    """Cutoff applied to `SearchResult.score` when building the chat context.
+
+    The baseline cutoffs (0.30 / 0.40) are cosine scores. In `v1` a hit carries a
+    fused RRF score (`1.0` at best, `0.5` when only one branch ranked it first),
+    so the cosine cutoff would drop hits for the wrong reason: `limit` bounds the
+    context instead.
+    """
+    return 0.0 if settings.retrieval_mode == "v1" else base
+
+
+async def _ranked_hits(
+    *,
+    query_vector: list[float],
+    query_text: str,
+    query_filter: Filter,
+    limit: int,
+    score_threshold: float,
+) -> list[ScoredPoint]:
+    """Dense search in `baseline`; dense + BM25 fused by RRF in `v1`.
+
+    The tenant filter is written on **both** prefetch branches and again on the
+    fused query: a prefetch without it would spend its `limit` on other tenants'
+    points. `score_threshold` keeps the baseline meaning — it only admits dense
+    candidates the baseline would have admitted; the sparse branch has none.
+    """
+    if settings.retrieval_mode != "v1":
+        return await qdrant_client.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_vector,
+            query_filter=query_filter,
+            limit=limit,
+            score_threshold=score_threshold,
+        )
+
+    branches = [
+        Prefetch(
+            query=query_vector,
+            using="dense",
+            filter=query_filter,
+            limit=limit,
+            score_threshold=score_threshold,
+        )
+    ]
+    sparse_query = query_sparse_vector(query_text)
+    if sparse_query is not None:
+        branches.append(
+            Prefetch(query=sparse_query, using="sparse", filter=query_filter, limit=limit)
+        )
+    response = await qdrant_client.query_points(
+        collection_name=COLLECTION_NAME,
+        prefetch=branches,
+        query=FusionQuery(fusion=Fusion.RRF),
+        query_filter=query_filter,
+        limit=limit,
+    )
+    return response.points
+
+
 async def search_documents(
     *,
     tenant_id: uuid.UUID,
@@ -129,18 +198,18 @@ async def search_documents(
         must_conditions.append(FieldCondition(key="type", match=MatchValue(value=filters.type)))
 
     fetch_limit = limit * 3
-    hits = await qdrant_client.search(
-        collection_name=COLLECTION_NAME,
+    hits = await _ranked_hits(
         query_vector=query_vector,
+        query_text=query,
         query_filter=Filter(must=must_conditions),
         limit=fetch_limit,
         score_threshold=0.55,
     )
 
     if not hits:
-        hits = await qdrant_client.search(
-            collection_name=COLLECTION_NAME,
+        hits = await _ranked_hits(
             query_vector=query_vector,
+            query_text=query,
             query_filter=Filter(must=must_conditions),
             limit=max(fetch_limit, 20),
             score_threshold=0.35,
@@ -382,10 +451,10 @@ async def search_by_lot(
     seen_point_ids: set[str] = set(scroll_point_ids)
     hits: list[object] = []
 
-    for _i, qvec in enumerate(vectors):
-        q_hits = await qdrant_client.search(
-            collection_name=COLLECTION_NAME,
+    for query_index, qvec in enumerate(vectors):
+        q_hits = await _ranked_hits(
             query_vector=qvec,
+            query_text=all_queries[query_index],
             query_filter=base_filter,
             limit=semantic_pool,
             score_threshold=0.30,
@@ -499,9 +568,9 @@ async def search_merged(
     query_best: list[tuple[str, float, object] | None] = [None] * len(vectors_list)
 
     for i, vector in enumerate(vectors_list):
-        hits = await qdrant_client.search(
-            collection_name=COLLECTION_NAME,
+        hits = await _ranked_hits(
             query_vector=vector,
+            query_text=queries[i],
             query_filter=qfilter,
             limit=limit * 3,
             score_threshold=score_threshold,
@@ -521,9 +590,9 @@ async def search_merged(
 
     if not best_hits:
         for i, vector in enumerate(vectors_list):
-            hits = await qdrant_client.search(
-                collection_name=COLLECTION_NAME,
+            hits = await _ranked_hits(
                 query_vector=vector,
+                query_text=queries[i],
                 query_filter=qfilter,
                 limit=max(limit * 3, 20),
                 score_threshold=0.35,

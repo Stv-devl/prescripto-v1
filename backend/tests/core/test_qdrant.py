@@ -9,6 +9,7 @@ with `tests/fakes.py`'s own hand-written `.search()`.
 
 from unittest.mock import AsyncMock
 
+import pytest
 from qdrant_client.models import Filter
 
 from app.core.qdrant import _search_compat
@@ -84,3 +85,38 @@ class TestSearchCompat:
             pass
         else:
             raise AssertionError("expected TypeError for an unrecognized keyword")
+
+
+class TestSearchCompatNamedVectors:
+    """`documents_v1` holds named vectors, so the dense search must say which one."""
+
+    async def test_targets_the_dense_vector_in_v1(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("app.core.qdrant.settings.retrieval_mode", "v1")
+        client = AsyncMock()
+        client.query_points.return_value = _FakeResponse([])
+
+        await _search_compat(client, collection_name="documents_v1", query_vector=[0.1], limit=5)
+
+        client.query_points.assert_awaited_once_with(
+            collection_name="documents_v1",
+            query=[0.1],
+            query_filter=None,
+            limit=5,
+            score_threshold=None,
+            using="dense",
+        )
+
+    async def test_names_no_vector_in_baseline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("app.core.qdrant.settings.retrieval_mode", "baseline")
+        client = AsyncMock()
+        client.query_points.return_value = _FakeResponse([])
+
+        await _search_compat(client, collection_name="documents", query_vector=[0.1], limit=5)
+
+        client.query_points.assert_awaited_once_with(
+            collection_name="documents",
+            query=[0.1],
+            query_filter=None,
+            limit=5,
+            score_threshold=None,
+        )

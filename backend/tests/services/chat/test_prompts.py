@@ -149,3 +149,97 @@ class TestGetForcedRelated:
     def test_no_match_returns_empty(self) -> None:
         result = get_forced_related("quels sont les lots du projet")
         assert result == []
+
+
+class TestNormesBlockByMode:
+    """The Normes rule of the system prompt and the ouvrage instruction, per mode."""
+
+    MUR = "Quelle est la composition du mur extérieur ?"
+    NO_MATCH = "Quels sont les lots du projet ?"
+    NORM_EXAMPLES = ("tous les DTU", "20.1", "26.1", "25.41")
+
+    def test_baseline_system_prompt_has_the_historical_sha256(self) -> None:
+        import hashlib
+
+        from app.services.chat.prompts import system_prompt_for
+
+        digest = hashlib.sha256(system_prompt_for("baseline").encode("utf-8")).hexdigest()
+        assert digest == "72164b88e250e32acdb5bd6fd47869f20d5292bddb1b67836c74937b76c90d52"
+
+    def test_v1_system_prompt_carries_the_context_and_ouvrage_rule(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert (
+            "écrites dans le contexte ET rattachées à l'ouvrage de la question"
+            in system_prompt_for("v1")
+        )
+
+    def test_v1_system_prompt_forbids_a_norm_absent_from_the_context(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "INTERDIT de citer une norme absente du contexte" in system_prompt_for("v1")
+
+    def test_v1_system_prompt_drops_the_block_when_there_is_no_norm(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "PAS de bloc Normes" in system_prompt_for("v1")
+
+    def test_v1_system_prompt_no_longer_asks_for_applicable_norms(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "DTU/NF EN applicables" not in system_prompt_for("v1")
+
+    def test_v1_system_prompt_differs_from_baseline_only_on_sentence_d(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        baseline = system_prompt_for("baseline")
+        v1 = system_prompt_for("v1")
+        assert "   d) " in baseline
+        assert "   ORDRE STRICT" in baseline
+        assert v1.split("   d) ")[0] == baseline.split("   d) ")[0]
+        assert v1[v1.index("   ORDRE STRICT"):] == baseline[baseline.index("   ORDRE STRICT"):]
+
+    def test_v1_system_prompt_still_forbids_signalling_an_absent_info(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "INTERDIT de signaler qu'une info est absente" in system_prompt_for("v1")
+
+    def test_v1_ouvrage_instruction_has_no_norm_example(self) -> None:
+        from app.services.chat.prompts import get_ouvrage_instruction
+
+        text = get_ouvrage_instruction(self.MUR, "v1")
+        assert text != ""
+        for example in self.NORM_EXAMPLES:
+            assert example not in text
+
+    def test_v1_ouvrage_instruction_carries_the_new_line_6(self) -> None:
+        from app.services.chat.prompts import get_ouvrage_instruction
+
+        text = get_ouvrage_instruction(self.MUR, "v1")
+        assert "uniquement avec les normes écrites dans le contexte pour cette paroi" in text
+
+    def test_v1_ouvrage_instruction_keeps_wall_composition_and_localisation(self) -> None:
+        from app.services.chat.prompts import get_ouvrage_instruction
+
+        text = get_ouvrage_instruction(self.MUR, "v1")
+        assert "COMPOSITION DES PAROIS EXTÉRIEURES" in text
+        assert "UN SEUL bloc Localisation à la fin" in text
+
+    def test_baseline_ouvrage_instruction_keeps_its_historical_norm_line(self) -> None:
+        from app.services.chat.prompts import get_ouvrage_instruction
+
+        text = get_ouvrage_instruction(self.MUR, "baseline")
+        assert "(tous les DTU : 20.1, 26.1, 25.41, etc.)" in text
+
+    def test_ouvrage_instruction_defaults_to_baseline(self) -> None:
+        from app.services.chat.prompts import get_ouvrage_instruction
+
+        text = get_ouvrage_instruction(self.MUR)
+        assert "(tous les DTU : 20.1, 26.1, 25.41, etc.)" in text
+        assert "uniquement avec les normes écrites dans le contexte pour cette paroi" not in text
+
+    def test_question_matching_no_ouvrage_gives_empty_instruction_in_both_modes(self) -> None:
+        from app.services.chat.prompts import get_ouvrage_instruction
+
+        assert get_ouvrage_instruction(self.NO_MATCH, "baseline") == ""
+        assert get_ouvrage_instruction(self.NO_MATCH, "v1") == ""

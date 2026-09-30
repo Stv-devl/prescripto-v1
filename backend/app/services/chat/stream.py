@@ -11,6 +11,7 @@ from mistralai.models import UsageInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.mistral import (
     MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS,
     mistral_client,
@@ -35,10 +36,10 @@ from app.services.chat.prompts import (
     LOCALISATION_INSTRUCTION,
     MAX_DISPLAYED_SOURCES,
     MIN_SOURCE_TEXT_LENGTH,
-    SYSTEM_PROMPT,
     classify_scope,
     get_forced_related,
     get_ouvrage_instruction,
+    system_prompt_for,
 )
 from app.services.chat.query_rewrite import rewrite_query
 from app.services.chat.schema_extraction import enrich_schema_with_search, extract_schema
@@ -584,7 +585,7 @@ def _build_mistral_messages(
     sources: list[Source],
 ) -> list[dict[str, str]]:
     """Build the Mistral message list for the RAG answer."""
-    system_content = SYSTEM_PROMPT
+    system_content = system_prompt_for(settings.retrieval_mode)
     if scope == "broad":
         system_content += (
             "\n\nQUESTION GÉNÉRALE :\n"
@@ -613,7 +614,7 @@ def _build_mistral_messages(
         )
     else:
         system_content += LOCALISATION_INSTRUCTION
-    system_content += get_ouvrage_instruction(question)
+    system_content += get_ouvrage_instruction(question, settings.retrieval_mode)
 
     has_table = structured == "table" and context_block
     has_schema = schema_flag == "schema" and context_block

@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
 import bcrypt
 from jose import JWTError, jwt
@@ -46,19 +47,27 @@ def create_refresh_token(user_id: uuid.UUID, tenant_id: uuid.UUID, token_version
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
-def create_reset_token(user_id: uuid.UUID) -> str:
+class ResetClaims(NamedTuple):
+    """What a password-reset token vouches for."""
+
+    user_id: uuid.UUID
+    token_version: int
+
+
+def create_reset_token(user_id: uuid.UUID, token_version: int) -> str:
     """Create a short-lived JWT token for password reset (30 min)."""
     expire = datetime.now(UTC) + timedelta(minutes=30)
     payload = {
         "sub": str(user_id),
         "exp": expire,
         "type": "reset",
+        "token_version": token_version,
     }
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
-def decode_reset_token(token: str) -> uuid.UUID:
-    """Decode a password-reset JWT. Returns user_id. Raises UnauthorizedError on failure."""
+def decode_reset_token(token: str) -> ResetClaims:
+    """Decode a password-reset JWT. Raises UnauthorizedError on failure."""
     try:
         payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
     except JWTError as exc:
@@ -71,7 +80,16 @@ def decode_reset_token(token: str) -> uuid.UUID:
     if sub is None:
         raise UnauthorizedError("invalid reset token")
 
-    return uuid.UUID(sub)
+    token_version = payload.get("token_version")
+    if not isinstance(token_version, int) or isinstance(token_version, bool):
+        raise UnauthorizedError("invalid reset token")
+
+    try:
+        user_id = uuid.UUID(sub)
+    except ValueError as exc:
+        raise UnauthorizedError("invalid reset token") from exc
+
+    return ResetClaims(user_id, token_version)
 
 
 def decode_token(token: str) -> dict[str, str | int | None]:

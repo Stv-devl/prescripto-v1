@@ -1,6 +1,9 @@
 """Chat prompts, constants, and keyword patterns."""
 
 import re
+from typing import Literal
+
+RetrievalMode = Literal["baseline", "v1"]
 
 # ── Numeric constants ─────────────────────────────────────────────
 
@@ -340,10 +343,41 @@ OUVRAGE_INSTRUCTIONS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
-def get_ouvrage_instruction(question: str) -> str:
+_NORMES_RULE_BASELINE = (
+    "   d) UN SEUL bloc **Normes** tout à la fin, APRÈS le bloc Localisation, "
+    "regroupant tous les DTU/NF EN applicables.\n"
+)
+_NORMES_RULE_V1 = (
+    "   d) Bloc **Normes** : cite UNIQUEMENT les normes (DTU, NF, NF EN…) écrites dans "
+    "le contexte ET rattachées à l'ouvrage de la question. "
+    "INTERDIT de citer une norme absente du contexte, même si elle s'applique à l'ouvrage. "
+    "INTERDIT de citer une norme du contexte qui concerne un autre ouvrage. "
+    "S'il y en a au moins une : UN SEUL bloc **Normes** tout à la fin, "
+    "APRÈS le bloc Localisation. "
+    "S'il n'y en a aucune : PAS de bloc Normes, sans le signaler.\n"
+)
+_OUVRAGE_NORMES_LINE_BASELINE = (
+    "6. UN SEUL bloc Normes à la fin (tous les DTU : 20.1, 26.1, 25.41, etc.)\n"
+)
+_OUVRAGE_NORMES_LINE_V1 = (
+    "6. UN SEUL bloc Normes à la fin, uniquement avec les normes écrites dans le contexte "
+    "pour cette paroi — pas de bloc sinon\n"
+)
+
+
+def system_prompt_for(mode: RetrievalMode) -> str:
+    """Return the RAG system prompt served in the given retrieval mode."""
+    if mode == "v1":
+        return SYSTEM_PROMPT.replace(_NORMES_RULE_BASELINE, _NORMES_RULE_V1)
+    return SYSTEM_PROMPT
+
+
+def get_ouvrage_instruction(question: str, mode: RetrievalMode = "baseline") -> str:
     """Return dynamic instruction if the question matches an ouvrage pattern."""
     for pattern, instruction in OUVRAGE_INSTRUCTIONS:
         if pattern.search(question):
+            if mode == "v1":
+                return instruction.replace(_OUVRAGE_NORMES_LINE_BASELINE, _OUVRAGE_NORMES_LINE_V1)
             return instruction
     return ""
 
