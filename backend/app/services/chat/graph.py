@@ -57,6 +57,13 @@ from app.services.chat.prompts import (
 from app.services.chat.query_rewrite import rewrite_query
 from app.services.chat.schema_extraction import enrich_schema_with_search, extract_schema
 from app.services.chat.search_limits import narrow_search_limit, query_limits
+from app.services.chat.sufficiency import (
+    judge_sufficiency,
+    merge_results,
+    reformulate,
+    should_judge,
+    should_retry,
+)
 from app.services.chat.table_extraction import extract_table
 
 configure_langsmith(settings)
@@ -83,16 +90,37 @@ def _usage_leg(usage: UsageInfo | None) -> dict[str, int | float]:
     return {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd}
 
 
-def _usage_event(rewrite: UsageInfo | None, generation: UsageInfo | None) -> dict[str, object]:
-    """Build the {rewrite, generation, total} usage payload for the SSE stream."""
+def _sum_legs(legs: list[dict[str, int | float]]) -> dict[str, int | float]:
+    return {
+        "input_tokens": sum(leg["input_tokens"] for leg in legs),
+        "output_tokens": sum(leg["output_tokens"] for leg in legs),
+        "cost_usd": sum(leg["cost_usd"] for leg in legs),
+    }
+
+
+def _usage_event(
+    rewrite: UsageInfo | None,
+    generation: UsageInfo | None,
+    agent: list[UsageInfo] | None = None,
+) -> dict[str, object]:
+    """Build the {rewrite, generation, [agent,] total} usage payload for the SSE stream.
+
+    `agent` (judge + reformulation calls) is passed in v1 only; without it the payload
+    keeps its three-key baseline shape.
+    """
     rewrite_leg = _usage_leg(rewrite)
     generation_leg = _usage_leg(generation)
-    total = {
-        "input_tokens": rewrite_leg["input_tokens"] + generation_leg["input_tokens"],
-        "output_tokens": rewrite_leg["output_tokens"] + generation_leg["output_tokens"],
-        "cost_usd": rewrite_leg["cost_usd"] + generation_leg["cost_usd"],
+    if agent is None:
+        total = _sum_legs([rewrite_leg, generation_leg])
+        return {"rewrite": rewrite_leg, "generation": generation_leg, "total": total}
+    agent_leg = _sum_legs([_usage_leg(usage) for usage in agent])
+    total = _sum_legs([rewrite_leg, generation_leg, agent_leg])
+    return {
+        "rewrite": rewrite_leg,
+        "generation": generation_leg,
+        "agent": agent_leg,
+        "total": total,
     }
-    return {"rewrite": rewrite_leg, "generation": generation_leg, "total": total}
 
 
 def _normalize_for_dedup(text: str) -> str:
@@ -424,6 +452,10 @@ class ChatState(TypedDict, total=False):
     table: StructuredTable | None
     schema_result: StructuredSchema | None
     error: str | None
+    judgment_missing: str | None
+    retry_query: str | None
+    retried: bool
+    agent_usage: list[UsageInfo]
 
 
 def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUID) -> object:
@@ -561,6 +593,44 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
                 )
         return {"schema_result": schema}
 
+    @traceable(name="judge_node")
+    async def judge_node(state: ChatState) -> dict[str, object]:
+        agent_usage = list(state.get("agent_usage") or [])
+        judgment = await judge_sufficiency(
+            state["question"], state["context_block"], usage_sink=agent_usage
+        )
+        retry_query: str | None = None
+        if should_retry(judgment, retried=state.get("retried", False)):
+            retry_query = await reformulate(
+                state["question"],
+                judgment.missing,
+                first_query=state["search_query"] or state["question"],
+                usage_sink=agent_usage,
+            )
+        return {
+            "judgment_missing": None if judgment.sufficient else judgment.missing,
+            "retry_query": retry_query,
+            "agent_usage": agent_usage,
+        }
+
+    @traceable(name="retry_search_node")
+    async def retry_search_node(state: ChatState) -> dict[str, object]:
+        retry_query = state["retry_query"] or state["question"]
+        try:
+            second = await _run_search(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                search_query=retry_query,
+                question=retry_query,
+                related_queries=[],
+                scope="specific",
+                search_limit=narrow_search_limit(settings.retrieval_mode, settings.v1_search_limit),
+            )
+        except Exception:
+            logger.exception("Retry search failed, serving the first search results")
+            return {"retried": True}
+        return {"search_results": merge_results(state["search_results"], second), "retried": True}
+
     async def error_node(state: ChatState) -> dict[str, object]:
         writer = get_stream_writer()
         writer({"error": state["error"]})
@@ -590,6 +660,7 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
                     "schema": schema,
                     "rewrite_usage": state.get("rewrite_usage"),
                     "generation_usage": state.get("generation_usage"),
+                    "agent_usage": state.get("agent_usage"),
                 }
             }
         )
@@ -598,13 +669,27 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     def _route_after_search(state: ChatState) -> str:
         return "error_node" if state.get("error") else "enrich_node"
 
-    def _route_after_enrich(state: ChatState) -> list[str]:
+    def _generation_targets(state: ChatState) -> list[str]:
         targets = ["generate_node"]
         if state["structured"] == "table" and state["context_block"]:
             targets.append("extract_table_node")
         if state["schema_flag"] == "schema" and state["context_block"]:
             targets.append("extract_schema_node")
         return targets
+
+    def _route_after_enrich(state: ChatState) -> list[str]:
+        needs_judge = should_judge(
+            settings.retrieval_mode,
+            state["scope"],
+            has_query=state["search_query"] is not None,
+            retried=state.get("retried", False),
+        )
+        return ["judge_node"] if needs_judge else _generation_targets(state)
+
+    def _route_after_judge(state: ChatState) -> list[str]:
+        return ["retry_search_node"] if state.get("retry_query") else _generation_targets(state)
+
+    generation_targets = ["generate_node", "extract_table_node", "extract_schema_node"]
 
     builder = StateGraph(ChatState)
     builder.add_node("rewrite_node", rewrite_node)
@@ -613,6 +698,8 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     builder.add_node("generate_node", generate_node)
     builder.add_node("extract_table_node", extract_table_node)
     builder.add_node("extract_schema_node", extract_schema_node)
+    builder.add_node("judge_node", judge_node)
+    builder.add_node("retry_search_node", retry_search_node)
     builder.add_node("error_node", error_node)
     builder.add_node("join_node", join_node)
 
@@ -620,10 +707,12 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     builder.add_edge("rewrite_node", "search_node")
     builder.add_conditional_edges("search_node", _route_after_search, ["error_node", "enrich_node"])
     builder.add_conditional_edges(
-        "enrich_node",
-        _route_after_enrich,
-        ["generate_node", "extract_table_node", "extract_schema_node"],
+        "enrich_node", _route_after_enrich, ["judge_node", *generation_targets]
     )
+    builder.add_conditional_edges(
+        "judge_node", _route_after_judge, ["retry_search_node", *generation_targets]
+    )
+    builder.add_edge("retry_search_node", "enrich_node")
     builder.add_edge("generate_node", "join_node")
     builder.add_edge("extract_table_node", "join_node")
     builder.add_edge("extract_schema_node", "join_node")
@@ -710,6 +799,13 @@ async def chat_stream(
     db.add(assistant_msg)
     await db.commit()
 
-    usage_event = _usage_event(final_payload["rewrite_usage"], final_payload["generation_usage"])  # type: ignore[arg-type]
+    agent_usage: list[UsageInfo] | None = None
+    if settings.retrieval_mode == "v1":
+        agent_usage = final_payload["agent_usage"] or []  # type: ignore[assignment]
+    usage_event = _usage_event(
+        final_payload["rewrite_usage"],  # type: ignore[arg-type]
+        final_payload["generation_usage"],  # type: ignore[arg-type]
+        agent_usage,
+    )
     yield f"data: {json.dumps({'usage': usage_event})}\n\n"
     yield "data: [DONE]\n\n"
