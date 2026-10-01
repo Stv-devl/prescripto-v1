@@ -41,6 +41,7 @@ from app.services.chat.chunk_enrichment import enrich_with_dpgf_quantities, expa
 from app.services.chat.context_budget import render_context_parts, select_by_score
 from app.services.chat.context_dedup import render_merged_context
 from app.services.chat.context_enrichment import build_db_context
+from app.services.chat.model_routing import Price, price_for, short_call_model
 from app.services.chat.prompts import (
     CONTEXT_MAX_CHARS,
     FORCED_SCHEMA_RE,
@@ -81,11 +82,12 @@ _LOCALIZATION_RE = re.compile(r"(?:au droit|localisation\s*:)[^\n]*", re.IGNOREC
 _NUMBERS_RE = re.compile(r"[\d.,]+\s*(?:m[²³23]?|ml|kg|l)\b")
 
 
-def _usage_leg(usage: UsageInfo | None) -> dict[str, int | float]:
-    """Token counts and USD cost for one Mistral call, zeroed if none was made."""
+def _usage_leg(
+    usage: UsageInfo | None, price: Price = MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
+) -> dict[str, int | float]:
+    """Token counts and USD cost for one Mistral call at `price`, zeroed if none was made."""
     input_tokens = usage.prompt_tokens or 0 if usage else 0
     output_tokens = usage.completion_tokens or 0 if usage else 0
-    price = MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
     cost_usd = (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
     return {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd}
 
@@ -102,18 +104,24 @@ def _usage_event(
     rewrite: UsageInfo | None,
     generation: UsageInfo | None,
     agent: list[UsageInfo] | None = None,
+    *,
+    short_call_price: Price | None = None,
+    rewrite_price: Price | None = None,
 ) -> dict[str, object]:
     """Build the {rewrite, generation, [agent,] total} usage payload for the SSE stream.
 
     `agent` (judge + reformulation calls) is passed in v1 only; without it the payload
-    keeps its three-key baseline shape.
+    keeps its three-key baseline shape. `short_call_price` prices the agent legs (the fast
+    model in v1) and, unless `rewrite_price` is given, the rewrite leg; generation is always
+    priced as mistral-large.
     """
-    rewrite_leg = _usage_leg(rewrite)
+    short_price = short_call_price or MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
+    rewrite_leg = _usage_leg(rewrite, rewrite_price or short_price)
     generation_leg = _usage_leg(generation)
     if agent is None:
         total = _sum_legs([rewrite_leg, generation_leg])
         return {"rewrite": rewrite_leg, "generation": generation_leg, "total": total}
-    agent_leg = _sum_legs([_usage_leg(usage) for usage in agent])
+    agent_leg = _sum_legs([_usage_leg(usage, short_price) for usage in agent])
     total = _sum_legs([rewrite_leg, generation_leg, agent_leg])
     return {
         "rewrite": rewrite_leg,
@@ -800,12 +808,18 @@ async def chat_stream(
     await db.commit()
 
     agent_usage: list[UsageInfo] | None = None
+    short_call_price: Price | None = None
+    rewrite_price: Price | None = None
     if settings.retrieval_mode == "v1":
         agent_usage = final_payload["agent_usage"] or []  # type: ignore[assignment]
+        short_call_price = price_for(short_call_model("v1", settings.v1_fast_model))
+        rewrite_price = price_for(short_call_model("v1", settings.v1_rewrite_model))
     usage_event = _usage_event(
         final_payload["rewrite_usage"],  # type: ignore[arg-type]
         final_payload["generation_usage"],  # type: ignore[arg-type]
         agent_usage,
+        short_call_price=short_call_price,
+        rewrite_price=rewrite_price,
     )
     yield f"data: {json.dumps({'usage': usage_event})}\n\n"
     yield "data: [DONE]\n\n"

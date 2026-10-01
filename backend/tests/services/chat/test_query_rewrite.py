@@ -387,3 +387,40 @@ class TestRewriteQueryGuard:
             "none",
             "none",
         )
+
+
+async def test_rewrite_in_v1_calls_the_configured_fast_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _fake_mistral(NORMAL_JSON)
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-small-latest")
+    monkeypatch.setattr("app.services.chat.query_rewrite.mistral_client", fake)
+    await rewrite_query(PLAIN_QUESTION, [])
+    assert fake.chat.complete_async.call_args.kwargs["model"] == "mistral-small-latest"
+
+
+async def test_rewrite_in_baseline_calls_mistral_large(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _fake_mistral(NORMAL_JSON)
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+    monkeypatch.setattr("app.services.chat.query_rewrite.mistral_client", fake)
+    await rewrite_query(PLAIN_QUESTION, [])
+    assert fake.chat.complete_async.call_args.kwargs["model"] == "mistral-large-latest"
+
+
+async def test_rewrite_in_v1_waits_on_the_fast_limiter_not_the_large_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    large_wait = AsyncMock()
+    fast_wait = AsyncMock()
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-small-latest")
+    monkeypatch.setattr("app.core.mistral.mistral_large_limiter.wait", large_wait)
+    monkeypatch.setattr("app.core.mistral.mistral_fast_limiter.wait", fast_wait)
+    monkeypatch.setattr(
+        "app.services.chat.query_rewrite.mistral_client", _fake_mistral(NORMAL_JSON)
+    )
+    await rewrite_query(PLAIN_QUESTION, [])
+    assert (fast_wait.await_count, large_wait.await_count) == (1, 0)

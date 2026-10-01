@@ -365,3 +365,72 @@ async def test_reformulate_request_with_an_empty_missing_says_it_is_not_specifie
     complete = _install_mistral(monkeypatch, '{"query": "cotes NGF maison"}', _usage())
     await reformulate("Quelles sont les cotes ?", "", first_query="cotes", usage_sink=[])
     assert "Ce qui manque : non précisé" in _user_message(complete)
+
+
+async def test_judge_in_v1_calls_the_configured_fast_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "retrieval_mode", "v1")
+    monkeypatch.setattr(settings, "v1_fast_model", "mistral-small-latest")
+    complete = _install_mistral(monkeypatch, '{"verdict": "suffisant"}', _usage())
+    await judge_sufficiency("Quelle epaisseur ?", "[cctp.pdf, p.1]\ntexte", usage_sink=[])
+    assert complete.call_args.kwargs["model"] == "mistral-small-latest"
+
+
+async def test_reformulate_in_v1_calls_the_configured_fast_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "retrieval_mode", "v1")
+    monkeypatch.setattr(settings, "v1_fast_model", "mistral-small-latest")
+    complete = _install_mistral(monkeypatch, '{"query": "epaisseur dalle"}', _usage())
+    await reformulate("Quelle epaisseur ?", "les cotes", first_query="epaisseur", usage_sink=[])
+    assert complete.call_args.kwargs["model"] == "mistral-small-latest"
+
+
+async def test_judge_in_baseline_calls_mistral_large(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "retrieval_mode", "baseline")
+    monkeypatch.setattr(settings, "v1_fast_model", "mistral-small-latest")
+    complete = _install_mistral(monkeypatch, '{"verdict": "suffisant"}', _usage())
+    await judge_sufficiency("Quelle epaisseur ?", "[cctp.pdf, p.1]\ntexte", usage_sink=[])
+    assert complete.call_args.kwargs["model"] == "mistral-large-latest"
+
+
+async def test_judge_in_v1_waits_on_the_fast_limiter_not_the_large_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+    from app.core.mistral import mistral_fast_limiter, mistral_large_limiter
+
+    monkeypatch.setattr(settings, "retrieval_mode", "v1")
+    monkeypatch.setattr(settings, "v1_fast_model", "mistral-small-latest")
+    fast_wait = AsyncMock()
+    large_wait = AsyncMock()
+    monkeypatch.setattr(mistral_fast_limiter, "wait", fast_wait)
+    monkeypatch.setattr(mistral_large_limiter, "wait", large_wait)
+    _install_mistral(monkeypatch, '{"verdict": "suffisant"}', _usage())
+    await judge_sufficiency("Quelle epaisseur ?", "[cctp.pdf, p.1]\ntexte", usage_sink=[])
+    assert (fast_wait.await_count, large_wait.await_count) == (1, 0)
+
+
+async def test_judge_in_baseline_waits_on_the_large_limiter_not_the_fast_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+    from app.core.mistral import mistral_fast_limiter, mistral_large_limiter
+
+    monkeypatch.setattr(settings, "retrieval_mode", "baseline")
+    fast_wait = AsyncMock()
+    large_wait = AsyncMock()
+    monkeypatch.setattr(mistral_fast_limiter, "wait", fast_wait)
+    monkeypatch.setattr(mistral_large_limiter, "wait", large_wait)
+    _install_mistral(monkeypatch, '{"verdict": "suffisant"}', _usage())
+    await judge_sufficiency("Quelle epaisseur ?", "[cctp.pdf, p.1]\ntexte", usage_sink=[])
+    assert (fast_wait.await_count, large_wait.await_count) == (0, 1)

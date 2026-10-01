@@ -247,3 +247,21 @@ class TestV1SearchLimit:
 
     def test_defaults_to_15_the_value_kept_on_the_pinned_replays(self) -> None:
         assert _settings().v1_search_limit == 15
+
+
+class TestV1ModelRouting:
+    def test_the_rewrite_model_defaults_to_mistral_large(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("V1_REWRITE_MODEL", raising=False)
+        assert _settings().v1_rewrite_model == "mistral-large-latest"
+
+    def test_the_fast_model_defaults_to_mistral_small(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("V1_FAST_MODEL", raising=False)
+        assert _settings().v1_fast_model == "mistral-small-latest"
+
+    def test_a_zero_fast_rate_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            _settings(v1_fast_rps=0)

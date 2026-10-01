@@ -27,7 +27,7 @@ import pytest
 from mistralai.models import UsageInfo
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.mistral import mistral_client, mistral_large_limiter
+from app.core.mistral import mistral_client, mistral_fast_limiter, mistral_large_limiter
 from app.models.tenant import Tenant
 from app.services.chat.graph import _usage_event
 from app.services.chat.prompts import REWRITE_PROMPT
@@ -435,6 +435,8 @@ async def test_v1_broad_usage_counts_judge_and_reformulation_in_agent_and_total(
     db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-large-latest")
     project, user = await _project_and_user(db, tenant_a)
     fake = FakeQdrant(_points(tenant_a.id, project.id))
     rewrite = _rewrite_response(query=BROAD_QUESTION)
@@ -467,12 +469,12 @@ async def test_v1_broad_usage_counts_judge_and_reformulation_in_agent_and_total(
     assert usage["agent"] == {
         "input_tokens": 3_000_000,
         "output_tokens": 2_000_000,
-        "cost_usd": 4.5,
+        "cost_usd": pytest.approx(1.65),
     }
     assert usage["total"] == {
         "input_tokens": 6_000_000,
         "output_tokens": 2_000_000,
-        "cost_usd": 6.0,
+        "cost_usd": pytest.approx(3.15),
     }
 
 
@@ -494,15 +496,18 @@ async def test_usage_event_with_an_agent_list_adds_the_agent_leg_and_sums_it_int
     }
 
 
-async def test_v1_broad_rate_limiter_is_awaited_once_per_mistral_call_including_judge_and_reformulation(
+async def test_v1_broad_each_mistral_call_waits_on_its_models_rate_limiter(
     db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-large-latest")
     project, user = await _project_and_user(db, tenant_a)
     fake = FakeQdrant(_points(tenant_a.id, project.id))
 
     with (
-        patch.object(mistral_large_limiter, "wait", new_callable=AsyncMock) as wait_mock,
+        patch.object(mistral_large_limiter, "wait", new_callable=AsyncMock) as large_wait,
+        patch.object(mistral_fast_limiter, "wait", new_callable=AsyncMock) as fast_wait,
         _patched_qdrant(fake),
         _patched_mistral(rewrite_response=_rewrite_response(query=BROAD_QUESTION)),
     ):
@@ -514,7 +519,8 @@ async def test_v1_broad_rate_limiter_is_awaited_once_per_mistral_call_including_
             question=BROAD_QUESTION,
         )
 
-    assert wait_mock.await_count == 4
+    assert large_wait.await_count == 2
+    assert fast_wait.await_count == 2
 
 
 async def test_v1_broad_generation_keeps_the_broad_prompt_after_the_retry(
@@ -733,3 +739,204 @@ async def test_v1_narrow_question_whose_llm_rewrite_says_broad_sends_no_judge(
 
     assert calls == ["rewrite"]
     assert B_MARK not in _prompt(stream_mock)
+
+
+# ── Jambe B — model routing ───────────────────────────────────────
+
+
+async def test_v1_rewrite_calls_the_rewrite_model_and_judge_and_reformulation_the_fast_model(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-large-latest")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+    calls: list[str] = []
+
+    with _patched_qdrant(fake), _patched_mistral(
+        rewrite_response=_rewrite_response(query=BROAD_QUESTION),
+        judge_response=INSUFFICIENT,
+        calls=calls,
+    ):
+        await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=BROAD_QUESTION,
+        )
+        models = [
+            call.kwargs["model"] for call in mistral_client.chat.complete_async.call_args_list
+        ]
+
+    assert calls == ["rewrite", "judge", "reformulate"]
+    assert models == ["mistral-large-latest", "mistral-small-latest", "mistral-small-latest"]
+
+
+async def test_changing_v1_fast_model_changes_the_model_called(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "ministral-8b-latest")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-large-latest")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+
+    with _patched_qdrant(fake), _patched_mistral(
+        rewrite_response=_rewrite_response(query=BROAD_QUESTION), judge_response=INSUFFICIENT
+    ):
+        await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=BROAD_QUESTION,
+        )
+        models = [
+            call.kwargs["model"] for call in mistral_client.chat.complete_async.call_args_list
+        ]
+
+    assert models == ["mistral-large-latest", "ministral-8b-latest", "ministral-8b-latest"]
+
+
+async def test_v1_generation_still_calls_mistral_large(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "mistral-small-latest")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+
+    with _patched_qdrant(fake), _patched_mistral(
+        rewrite_response=_rewrite_response(query=BROAD_QUESTION), judge_response=INSUFFICIENT
+    ) as stream_mock:
+        await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=BROAD_QUESTION,
+        )
+        generation_model = stream_mock.call_args.kwargs["model"]
+
+    assert generation_model == "mistral-large-latest"
+
+
+async def test_v1_rewrite_leg_is_priced_at_the_rewrite_models_price(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-large-latest")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+    rewrite = _rewrite_response(query=BROAD_QUESTION)
+    rewrite.usage = UsageInfo(prompt_tokens=1_000_000, completion_tokens=0, total_tokens=1_000_000)
+
+    with _patched_qdrant(fake), _patched_mistral(
+        rewrite_response=rewrite, judge_response=SUFFICIENT
+    ):
+        events = await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=BROAD_QUESTION,
+        )
+
+    assert _usage_of(events)["rewrite"] == {
+        "input_tokens": 1_000_000,
+        "output_tokens": 0,
+        "cost_usd": pytest.approx(0.5),
+    }
+
+
+async def test_usage_event_with_a_short_call_price_prices_rewrite_and_agent_at_it_and_generation_at_large() -> (
+    None
+):
+    rewrite = UsageInfo(prompt_tokens=1_000_000, completion_tokens=0, total_tokens=1_000_000)
+    generation = UsageInfo(prompt_tokens=2_000_000, completion_tokens=0, total_tokens=2_000_000)
+    judge = UsageInfo(prompt_tokens=2_000_000, completion_tokens=1_000_000, total_tokens=3_000_000)
+    reformulation = UsageInfo(
+        prompt_tokens=1_000_000, completion_tokens=1_000_000, total_tokens=2_000_000
+    )
+
+    event = _usage_event(
+        rewrite,
+        generation,
+        agent=[judge, reformulation],
+        short_call_price={"input": 0.15, "output": 0.6},
+    )
+
+    assert event["rewrite"] == {
+        "input_tokens": 1_000_000,
+        "output_tokens": 0,
+        "cost_usd": pytest.approx(0.15),
+    }
+    assert event["generation"] == {
+        "input_tokens": 2_000_000,
+        "output_tokens": 0,
+        "cost_usd": pytest.approx(1.0),
+    }
+    assert event["agent"] == {
+        "input_tokens": 3_000_000,
+        "output_tokens": 2_000_000,
+        "cost_usd": pytest.approx(1.65),
+    }
+    assert event["total"] == {
+        "input_tokens": 6_000_000,
+        "output_tokens": 2_000_000,
+        "cost_usd": pytest.approx(2.8),
+    }
+
+
+async def test_baseline_broad_question_prices_every_leg_at_the_large_price(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+    rewrite = _rewrite_response(query=BROAD_QUESTION)
+    rewrite.usage = UsageInfo(prompt_tokens=1_000_000, completion_tokens=0, total_tokens=1_000_000)
+    generation = UsageInfo(prompt_tokens=2_000_000, completion_tokens=0, total_tokens=2_000_000)
+
+    with _patched_qdrant(fake), _patched_mistral(
+        rewrite_response=rewrite, generation_usage=generation
+    ):
+        events = await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=BROAD_QUESTION,
+        )
+
+    usage = _usage_of(events)
+    assert usage["rewrite"]["cost_usd"] == pytest.approx(0.5)
+    assert usage["total"]["cost_usd"] == pytest.approx(1.5)
+
+
+async def test_v1_rewrite_leg_follows_a_non_large_rewrite_models_price(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-small-latest")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+    rewrite = _rewrite_response(query=BROAD_QUESTION)
+    rewrite.usage = UsageInfo(prompt_tokens=1_000_000, completion_tokens=0, total_tokens=1_000_000)
+
+    with _patched_qdrant(fake), _patched_mistral(
+        rewrite_response=rewrite, judge_response=SUFFICIENT
+    ):
+        events = await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=BROAD_QUESTION,
+        )
+
+    assert _usage_of(events)["rewrite"]["cost_usd"] == pytest.approx(0.15)

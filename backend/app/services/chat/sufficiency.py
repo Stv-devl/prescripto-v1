@@ -9,8 +9,10 @@ from dataclasses import dataclass
 
 from mistralai.models import UsageInfo
 
-from app.core.mistral import mistral_client, mistral_large_limiter
+from app.core.config import settings
+from app.core.mistral import mistral_client, mistral_fast_limiter, mistral_large_limiter
 from app.schemas.search import SearchResult
+from app.services.chat.model_routing import is_large, short_call_model
 
 logger = logging.getLogger(__name__)
 
@@ -137,9 +139,11 @@ def parse_reformulation(raw: str | None, *, first_query: str) -> str | None:
 
 
 async def _complete(system: str, user: str, usage_sink: list[UsageInfo]) -> str | None:
-    await mistral_large_limiter.wait()
+    model = short_call_model(settings.retrieval_mode, settings.v1_fast_model)
+    limiter = mistral_large_limiter if is_large(model) else mistral_fast_limiter
+    await limiter.wait()
     response = await mistral_client.chat.complete_async(
-        model="mistral-large-latest",
+        model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.0,
         max_tokens=150,

@@ -34,3 +34,4 @@ class _RateLimiter:
 
 
 mistral_large_limiter = _RateLimiter(requests_per_second=0.25)
+mistral_fast_limiter = _RateLimiter(requests_per_second=settings.v1_fast_rps)
