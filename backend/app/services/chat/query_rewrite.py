@@ -9,7 +9,8 @@ from typing import Protocol
 from mistralai.models import UsageInfo
 
 from app.core.config import settings
-from app.core.mistral import mistral_client, mistral_large_limiter
+from app.core.mistral import mistral_client, mistral_fast_limiter, mistral_large_limiter
+from app.services.chat.model_routing import is_large, short_call_model
 from app.services.chat.prompts import OFF_TOPIC, REWRITE_PROMPT
 from app.services.sparse import tokenize
 
@@ -70,9 +71,11 @@ async def rewrite_query(
     messages.append({"role": "user", "content": question})
 
     try:
-        await mistral_large_limiter.wait()
+        model = short_call_model(settings.retrieval_mode, settings.v1_rewrite_model)
+        limiter = mistral_large_limiter if is_large(model) else mistral_fast_limiter
+        await limiter.wait()
         response = await mistral_client.chat.complete_async(
-            model="mistral-large-latest",
+            model=model,
             messages=messages,
             temperature=0.0,
             max_tokens=300,

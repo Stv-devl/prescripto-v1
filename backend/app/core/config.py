@@ -55,6 +55,39 @@ class Settings(BaseSettings):
             "never overwritten by a v1 re-ingestion."
         ),
     )
+    v1_search_limit: int = Field(
+        default=15,
+        ge=1,
+        description=(
+            "Narrow-scope chat search limit under RETRIEVAL_MODE=v1; the per-query floor "
+            "scales with it (services/chat/search_limits.py). Baseline always uses 20. "
+            "15 kept on the pinned replays of 2026-10-01 (sprint/eval/result/v1-pin-delta.md)."
+        ),
+    )
+    v1_fast_model: str = Field(
+        default="mistral-small-latest",
+        description=(
+            "Model of the sufficiency judge and the retry reformulation under "
+            "RETRIEVAL_MODE=v1 (the rewrite has its own V1_REWRITE_MODEL); generation stays "
+            "on mistral-large. Baseline always uses mistral-large (services/chat/model_routing.py)."
+        ),
+    )
+    v1_rewrite_model: str = Field(
+        default="mistral-large-latest",
+        description=(
+            "Model of the query rewrite under RETRIEVAL_MODE=v1. Kept on mistral-large: on "
+            "mistral-small the rewrite lost a related query and Q12 regressed "
+            "(sprint/eval/result/v1-small-delta.md). A non-large value uses the fast limiter."
+        ),
+    )
+    v1_fast_rps: float = Field(
+        default=1.0,
+        gt=0,
+        description=(
+            "Requests per second allowed on the fast model's own rate limiter. Prudent "
+            "default: the workspace quota of mistral-small was not read when this was set."
+        ),
+    )
 
     mistral_api_key: str
     pixtral_large_model: str = "pixtral-large-latest"

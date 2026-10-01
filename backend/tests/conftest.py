@@ -51,20 +51,23 @@ def _forget_rate_limits() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _fast_mistral_limiter() -> Iterator[None]:
-    """Neutralizes the real 0.25 req/s Mistral limiter's sleep in tests.
+    """Neutralizes the real Mistral limiters' sleep in tests (large and fast).
 
-    It is a process-wide singleton (app/core/mistral.py) shared across the
+    They are process-wide singletons (app/core/mistral.py) shared across the
     whole session: without this, any test that exercises the real chat
     pipeline (several calls per case) serializes onto a strict 4s cadence and
     the suite takes minutes instead of seconds.
     """
-    from app.core.mistral import mistral_large_limiter
+    from app.core.mistral import mistral_fast_limiter, mistral_large_limiter
 
-    original_interval = mistral_large_limiter._min_interval
-    mistral_large_limiter._min_interval = 0.0
-    mistral_large_limiter._next_slot = 0.0
+    limiters = (mistral_large_limiter, mistral_fast_limiter)
+    original_intervals = [limiter._min_interval for limiter in limiters]
+    for limiter in limiters:
+        limiter._min_interval = 0.0
+        limiter._next_slot = 0.0
     yield
-    mistral_large_limiter._min_interval = original_interval
+    for limiter, interval in zip(limiters, original_intervals, strict=True):
+        limiter._min_interval = interval
 
 
 @pytest.fixture(autouse=True)

@@ -39,6 +39,7 @@ from app.models.message import Message
 from app.models.project import Project
 from app.models.tenant import Tenant
 from app.models.user import User
+from app.schemas.search import SearchResult
 from app.services import project as project_service
 from app.services.chat.prompts import REWRITE_PROMPT, SCHEMA_EXTRACTION_PROMPT, TABLE_EXTRACTION_PROMPT
 from tests.fakes import FakePoint, FakeQdrant
@@ -831,3 +832,386 @@ class TestSystemPromptByMode:
         monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
         v1_content = self._system_content(self.WALL_QUESTION, "specific")
         assert baseline_content != v1_content
+
+
+class TestNormesBlockOptionalAssembled:
+    """In v1 the assembled system message never presents the Normes block as mandatory."""
+
+    import pytest
+
+    BROAD_QUESTION = "Quels sont les lots du projet ?"
+    WALL_QUESTION = "Quelle est la composition du mur extérieur ?"
+    FOUNDATION_QUESTION = "Comment sont réalisées les fondations ?"
+    OLD_ORDER_LINE = "**Localisation** puis **Normes** — rien après"
+    V1_ORDER_LINE = (
+        "   ORDRE STRICT en fin de réponse : **Localisation**, puis **Normes** "
+        "UNIQUEMENT s'il y a au moins une norme à citer (règle d) — rien après. "
+        "Une réponse sans bloc Normes est correcte.\n"
+    )
+    OLD_PARENTHESIS = "(avant Normes)"
+    V1_PARENTHESIS = "(avant le bloc Normes s'il y en a un)"
+
+    @staticmethod
+    def _system_content(question: str, scope: str) -> str:
+        from app.services.chat.graph import _build_mistral_messages
+
+        messages = _build_mistral_messages(
+            context_block="",
+            question=question,
+            recent_messages=[],
+            scope=scope,
+            structured="none",
+            schema_flag="none",
+            sources=[],
+        )
+        return messages[0]["content"]
+
+    def test_v1_foundation_question_drops_the_old_order_line_and_parenthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode neither unconditional mention of the Normes block is served."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.FOUNDATION_QUESTION, "specific")
+        assert self.OLD_ORDER_LINE not in content
+        assert self.OLD_PARENTHESIS not in content
+
+    def test_v1_foundation_question_carries_the_conditional_order_line_and_parenthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode the order line and the localisation parenthesis are conditional."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.FOUNDATION_QUESTION, "specific")
+        assert self.V1_ORDER_LINE in content
+        assert self.V1_PARENTHESIS in content
+
+    def test_v1_wall_question_drops_the_old_order_line_and_parenthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode a question matching an ouvrage pattern is served the same way."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.WALL_QUESTION, "specific")
+        assert self.OLD_ORDER_LINE not in content
+        assert self.OLD_PARENTHESIS not in content
+
+    def test_baseline_foundation_question_keeps_the_old_order_line_and_parenthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In baseline mode both historical mentions are still served."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+        content = self._system_content(self.FOUNDATION_QUESTION, "specific")
+        assert self.OLD_ORDER_LINE in content
+        assert self.OLD_PARENTHESIS in content
+
+    def test_v1_broad_question_carries_the_order_line_and_no_localisation_parenthesis(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """In v1 mode a broad question keeps its exemption and gets no localisation text."""
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        content = self._system_content(self.BROAD_QUESTION, "broad")
+        assert self.V1_ORDER_LINE in content
+        assert "PAS de bloc Localisation ni Normes pour les questions générales" in content
+        assert self.OLD_PARENTHESIS not in content
+        assert self.V1_PARENTHESIS not in content
+
+
+class TestGraphContextMergesArticleCopies:
+    """j2-contexte-dedup-articles: a paragraph copied across lots reaches the v1 model once."""
+
+    import pytest
+
+    BODY = (
+        "Réglementation thermique\n"
+        "Le bâtiment doit respecter la RT 2012 pour l'ensemble des locaux chauffés du lot."
+    )
+    A1 = "1.1.3.9. " + BODY
+    A4 = "4.1.3.11. " + BODY
+    X = (
+        "2.3.1.1. Enduit monocouche\n"
+        "Enduit monocouche gratté de teinte claire sur l'ensemble des façades de la maison."
+    )
+    SHARED_SENTENCE = "Le bâtiment doit respecter la RT 2012"
+    DOC_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+    PROJECT_ID = uuid.UUID("22222222-2222-2222-2222-222222222222")
+
+    def _chunk(
+        self, text: str, *, page: int, lot: str, score: float, position: int = 0
+    ) -> "SearchResult":
+        from app.schemas.search import SearchResult
+
+        return SearchResult(
+            text=text,
+            page=page,
+            position=position,
+            filename="CCTP.pdf",
+            document_id=self.DOC_ID,
+            project_id=self.PROJECT_ID,
+            score=score,
+            lot=lot,
+            phase="PRO",
+            type="CCTP",
+        )
+
+    def _copies(self) -> list["SearchResult"]:
+        return [
+            self._chunk(self.A1, page=5, lot="01", score=0.9),
+            self._chunk(self.A4, page=46, lot="04", score=0.5),
+        ]
+
+    def test_v1_graph_context_contains_a_copied_paragraph_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two copies differing by their article number are rendered once, under a merged header."""
+        from app.services.chat.graph import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        context, _ = _build_context_and_sources(
+            self._copies(), score_threshold=0.40, context_max=20000, max_sources=5
+        )
+        assert context.count(self.SHARED_SENTENCE) == 1
+        assert "[CCTP.pdf, p.5 ; aussi : CCTP.pdf, p.46]" in context
+
+    def test_v1_graph_sources_are_unchanged_by_the_merge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The merge only touches the context text: both copies stay in the sources."""
+        from app.schemas.chat import Source
+        from app.services.chat.graph import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        _, sources = _build_context_and_sources(
+            self._copies(), score_threshold=0.40, context_max=20000, max_sources=5
+        )
+        assert sources == [
+            Source(
+                document_id=self.DOC_ID,
+                filename="CCTP.pdf",
+                page=5,
+                lot="01",
+                phase="PRO",
+                text=self.A1,
+                section_title=None,
+            ),
+            Source(
+                document_id=self.DOC_ID,
+                filename="CCTP.pdf",
+                page=46,
+                lot="04",
+                phase="PRO",
+                text=self.A4,
+                section_title=None,
+            ),
+        ]
+
+    def test_baseline_graph_context_and_sources_are_byte_identical_to_the_unmerged_render(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Baseline never merges: both copies, historical headers and separators."""
+        from app.schemas.chat import Source
+        from app.services.chat.graph import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+        context, sources = _build_context_and_sources(
+            self._copies(), score_threshold=0.40, context_max=20000, max_sources=5
+        )
+        assert context == (
+            "\n=== 01 ===\n"
+            + "\n---\n"
+            + "[CCTP.pdf, p.5]\n"
+            + self.A1
+            + "\n---\n"
+            + "\n=== 04 ===\n"
+            + "\n---\n"
+            + "[CCTP.pdf, p.46]\n"
+            + self.A4
+        )
+        assert sources == [
+            Source(
+                document_id=self.DOC_ID,
+                filename="CCTP.pdf",
+                page=5,
+                lot="01",
+                phase="PRO",
+                text=self.A1,
+                section_title=None,
+            ),
+            Source(
+                document_id=self.DOC_ID,
+                filename="CCTP.pdf",
+                page=46,
+                lot="04",
+                phase="PRO",
+                text=self.A4,
+                section_title=None,
+            ),
+        ]
+
+    def test_v1_graph_context_without_copies_is_byte_identical_to_the_unmerged_render(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With nothing to merge, the v1 context is the historical render."""
+        from app.services.chat.graph import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        context, _ = _build_context_and_sources(
+            [
+                self._chunk(self.A1, page=5, lot="01", score=0.9),
+                self._chunk(self.X, page=50, lot="04", score=0.5),
+            ],
+            score_threshold=0.40,
+            context_max=20000,
+            max_sources=5,
+        )
+        assert context == (
+            "\n=== 01 ===\n"
+            + "\n---\n"
+            + "[CCTP.pdf, p.5]\n"
+            + self.A1
+            + "\n---\n"
+            + "\n=== 04 ===\n"
+            + "\n---\n"
+            + "[CCTP.pdf, p.50]\n"
+            + self.X
+        )
+
+    def test_v1_graph_merge_never_admits_a_passage_that_did_not_fit_the_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The room freed by a merge is not refilled: the passage left out stays out."""
+        from app.services.chat.graph import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        context_max = (
+            len("[CCTP.pdf, p.5]\n" + self.A1) + len("[CCTP.pdf, p.46]\n" + self.A4) + 10
+        )
+        context, _ = _build_context_and_sources(
+            [
+                self._chunk(self.A1, page=5, lot="01", score=0.9, position=0),
+                self._chunk(self.A4, page=46, lot="01", score=0.5, position=1),
+                self._chunk(self.X, page=50, lot="01", score=0.4, position=2),
+            ],
+            score_threshold=0.40,
+            context_max=context_max,
+            max_sources=5,
+        )
+        assert "Enduit monocouche gratté" not in context
+        assert context.count(self.SHARED_SENTENCE) == 1
+
+
+class TestNarrowSearchLimit:
+    """j2-nombre-passages: the v1 narrow-scope search limit and its scaled per-query floor."""
+
+    import pytest
+
+    NARROW_QUESTION = "Quelle est l'épaisseur de la dalle du garage ?"
+    RELATED = ["liée 1", "liée 2", "liée 3", "liée 4"]
+    FORCED = [f"forcée {i}" for i in range(7)]
+
+    def _patch_search(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.schemas.search import SearchResult
+        from app.services import search as search_service
+        from app.services.chat import graph
+
+        forced = self.FORCED
+
+        async def _search_merged(*, queries: list[str], limit: int, **_: object) -> list[SearchResult]:
+            prefix = "forced" if queries == forced else "main"
+            return [
+                SearchResult(
+                    text=f"{prefix}-{i} passage de test",
+                    page=1,
+                    position=i,
+                    filename="cctp.pdf",
+                    document_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+                    project_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                    score=0.9,
+                    lot="02",
+                    phase="PRO",
+                    type="CCTP",
+                )
+                for i in range(limit)
+            ]
+
+        async def _expand(_tenant: object, _project: object, results: list[SearchResult]) -> list[SearchResult]:
+            return results
+
+        async def _enrich(
+            _tenant: object, _project: object, _query: object, _question: object, results: list[SearchResult]
+        ) -> list[SearchResult]:
+            return results
+
+        monkeypatch.setattr(search_service, "search_merged", _search_merged)
+        monkeypatch.setattr(graph, "expand_heading_chunks", _expand)
+        monkeypatch.setattr(graph, "enrich_with_dpgf_quantities", _enrich)
+        monkeypatch.setattr(graph, "get_forced_related", lambda _query: list(forced))
+
+    async def _count(self, monkeypatch: pytest.MonkeyPatch, search_limit: int) -> int:
+        from app.services.chat import graph
+
+        self._patch_search(monkeypatch)
+        results = await graph._run_search(
+            tenant_id=uuid.UUID("33333333-3333-3333-3333-333333333333"),
+            project_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+            search_query="épaisseur dalle garage",
+            question=self.NARROW_QUESTION,
+            related_queries=list(self.RELATED),
+            scope="specific",
+            search_limit=search_limit,
+        )
+        return len(results)
+
+    async def test_run_search_scales_main_and_forced_limits_at_10(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Six main and seven forced queries at 10: 12 + 14 results."""
+        assert await self._count(monkeypatch, 10) == 26
+
+    async def test_run_search_keeps_the_historical_limits_at_20(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """At 20 the limits are the historical max(20, n * 5): 30 + 35 results."""
+        assert await self._count(monkeypatch, 20) == 65
+
+    async def _recorded_limit(
+        self, db: AsyncSession, tenant: Tenant, monkeypatch: pytest.MonkeyPatch, mode: str
+    ) -> list[int]:
+        from app.services.chat import graph
+        from app.services.chat.prompts import classify_scope
+
+        assert classify_scope(self.NARROW_QUESTION) == "specific"
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", mode)
+        monkeypatch.setattr("app.core.config.settings.v1_search_limit", 10)
+        recorded: list[int] = []
+
+        async def _rewrite(
+            _question: str, _history: object, usage_sink: object = None
+        ) -> tuple[str, list[str], str, str, str]:
+            return ("épaisseur dalle garage", [], "specific", "none", "none")
+
+        async def _run_search(*, search_limit: int, **_: object) -> list[SearchResult]:
+            recorded.append(search_limit)
+            raise RuntimeError("search stopped by the test after recording its limit")
+
+        monkeypatch.setattr(graph, "rewrite_query", _rewrite)
+        monkeypatch.setattr(graph, "_run_search", _run_search)
+        project, user = await _project_and_user(db, tenant)
+        events = await _stream(
+            db,
+            tenant_id=tenant.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=self.NARROW_QUESTION,
+        )
+        assert events[-1] == "DONE"
+        return recorded
+
+    async def test_v1_narrow_search_uses_the_configured_limit(
+        self, db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under v1 the narrow-scope search receives the configured limit."""
+        assert await self._recorded_limit(db, tenant_a, monkeypatch, "v1") == [10]
+
+    async def test_baseline_narrow_search_ignores_the_configured_limit(
+        self, db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under baseline the narrow-scope search keeps 20 whatever is configured."""
+        assert await self._recorded_limit(db, tenant_a, monkeypatch, "baseline") == [20]

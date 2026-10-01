@@ -27,22 +27,25 @@ from app.services.chat.chunk_enrichment import (
     enrich_with_dpgf_quantities,
     expand_heading_chunks,
 )
+from app.services.chat.context_budget import render_context_parts, select_by_score
+from app.services.chat.context_dedup import render_merged_context
 from app.services.chat.context_enrichment import build_db_context
 from app.services.chat.prompts import (
     CONTEXT_MAX_CHARS,
     FORCED_SCHEMA_RE,
     FORCED_SCORE_FLOOR,
     HISTORY_WINDOW,
-    LOCALISATION_INSTRUCTION,
     MAX_DISPLAYED_SOURCES,
     MIN_SOURCE_TEXT_LENGTH,
     classify_scope,
     get_forced_related,
     get_ouvrage_instruction,
+    localisation_instruction_for,
     system_prompt_for,
 )
 from app.services.chat.query_rewrite import rewrite_query
 from app.services.chat.schema_extraction import enrich_schema_with_search, extract_schema
+from app.services.chat.search_limits import narrow_search_limit, query_limits
 from app.services.chat.table_extraction import extract_table
 
 logger = logging.getLogger(__name__)
@@ -207,7 +210,7 @@ async def chat_stream(
         structured = "none"
         schema_flag = "none"
     else:
-        search_limit = 20
+        search_limit = narrow_search_limit(settings.retrieval_mode, settings.v1_search_limit)
         context_max = CONTEXT_MAX_CHARS
         score_threshold = 0.40
         max_sources = MAX_DISPLAYED_SOURCES
@@ -386,7 +389,9 @@ async def _run_search(
         f"{len(forced_queries)} forced queries: {forced_queries}"
     )
 
-    main_limit = max(search_limit, len(main_queries) * 5)
+    main_limit, forced_limit = query_limits(
+        search_limit, main_queries=len(main_queries), forced_queries=len(forced_queries)
+    )
     search_results = await search_service.search_merged(
         tenant_id=tenant_id,
         project_id=project_id,
@@ -406,7 +411,7 @@ async def _run_search(
             project_id=project_id,
             queries=forced_queries,
             filters=SearchFilters(),
-            limit=max(search_limit, len(forced_queries) * 5),
+            limit=forced_limit,
             score_threshold=0.30,
         )
         logger.debug(
@@ -486,36 +491,54 @@ def _build_context_and_sources(
     multiple_lots = len(lot_groups) > 1
     included_chunks: list[SearchResult] = []
 
-    for lot_key in sorted(lot_groups.keys()):
-        if context_full:
-            break
-        if multiple_lots:
-            separator = f"\n=== {lot_key} ===\n"
-            if total_chars + len(separator) > context_max:
-                logger.debug(
-                    f"[CONTEXT DEBUG] Context full at {total_chars} chars, {kept_count} chunks kept"
-                )
-                break
-            context_parts.append(separator)
-            total_chars += len(separator)
-
-        for sr in lot_groups[lot_key]:
-            chunk_text = f"[{sr.filename}, p.{sr.page}]\n{sr.text}"
-            if total_chars + len(chunk_text) > context_max:
-                logger.debug(
-                    f"[CONTEXT DEBUG] Context full at {total_chars} chars, {kept_count} chunks kept"
-                )
-                context_full = True
-                break
-            context_parts.append(chunk_text)
-            total_chars += len(chunk_text)
-            kept_count += 1
-            included_chunks.append(sr)
+    if settings.retrieval_mode == "v1":
+        included_chunks = select_by_score(
+            valid_chunks, context_max=context_max, multiple_lots=multiple_lots
+        )
+        context_parts = render_context_parts(included_chunks, multiple_lots=multiple_lots)
+        kept_count = len(included_chunks)
+        total_chars = len("\n---\n".join(context_parts))
+        for rank, sr in enumerate(included_chunks, start=1):
             logger.debug(
-                f"[CONTEXT DEBUG] chunk#{kept_count}: score={sr.score:.2f} lot='{lot_key}' "
+                f"[CONTEXT DEBUG] chunk#{rank}: score={sr.score:.2f} lot='{sr.lot or 'unknown'}' "
                 f"type={sr.type or '?'} file='{sr.filename}' p.{sr.page} "
                 f"— '{sr.text[:80].replace(chr(10), ' ')}'"
             )
+        logger.debug(
+            f"[CONTEXT DEBUG] Score-ordered budget: {kept_count} of {len(valid_chunks)} chunks "
+            f"kept, {total_chars} plain chars before article-copy merge"
+        )
+    else:
+        for lot_key in sorted(lot_groups.keys()):
+            if context_full:
+                break
+            if multiple_lots:
+                separator = f"\n=== {lot_key} ===\n"
+                if total_chars + len(separator) > context_max:
+                    logger.debug(
+                        f"[CONTEXT DEBUG] Context full at {total_chars} chars, {kept_count} chunks kept"
+                    )
+                    break
+                context_parts.append(separator)
+                total_chars += len(separator)
+
+            for sr in lot_groups[lot_key]:
+                chunk_text = f"[{sr.filename}, p.{sr.page}]\n{sr.text}"
+                if total_chars + len(chunk_text) > context_max:
+                    logger.debug(
+                        f"[CONTEXT DEBUG] Context full at {total_chars} chars, {kept_count} chunks kept"
+                    )
+                    context_full = True
+                    break
+                context_parts.append(chunk_text)
+                total_chars += len(chunk_text)
+                kept_count += 1
+                included_chunks.append(sr)
+                logger.debug(
+                    f"[CONTEXT DEBUG] chunk#{kept_count}: score={sr.score:.2f} lot='{lot_key}' "
+                    f"type={sr.type or '?'} file='{sr.filename}' p.{sr.page} "
+                    f"— '{sr.text[:80].replace(chr(10), ' ')}'"
+                )
 
     # ── Phase 4: Build sources (same logic) ──────────────────────
     seen_source_keys: dict[tuple[uuid.UUID, int], int] = {}
@@ -570,7 +593,12 @@ def _build_context_and_sources(
 
     sources = sources[:max_sources]
 
-    context_block = "\n---\n".join(context_parts)
+    merged = (
+        render_merged_context(included_chunks, multiple_lots=multiple_lots)
+        if settings.retrieval_mode == "v1"
+        else None
+    )
+    context_block = merged if merged is not None else "\n---\n".join(context_parts)
     return context_block, sources
 
 
@@ -613,7 +641,7 @@ def _build_mistral_messages(
             "3-5 phrases synthétiques, pas de développement par lot/ouvrage."
         )
     else:
-        system_content += LOCALISATION_INSTRUCTION
+        system_content += localisation_instruction_for(settings.retrieval_mode)
     system_content += get_ouvrage_instruction(question, settings.retrieval_mode)
 
     has_table = structured == "table" and context_block

@@ -189,7 +189,9 @@ class TestNormesBlockByMode:
 
         assert "DTU/NF EN applicables" not in system_prompt_for("v1")
 
-    def test_v1_system_prompt_differs_from_baseline_only_on_sentence_d(self) -> None:
+    def test_v1_system_prompt_differs_from_baseline_only_on_sentence_d_and_the_order_line(
+        self,
+    ) -> None:
         from app.services.chat.prompts import system_prompt_for
 
         baseline = system_prompt_for("baseline")
@@ -197,7 +199,11 @@ class TestNormesBlockByMode:
         assert "   d) " in baseline
         assert "   ORDRE STRICT" in baseline
         assert v1.split("   d) ")[0] == baseline.split("   d) ")[0]
-        assert v1[v1.index("   ORDRE STRICT"):] == baseline[baseline.index("   ORDRE STRICT"):]
+        assert v1[v1.index("   ORDRE STRICT"):] == (
+            "   ORDRE STRICT en fin de réponse : **Localisation**, puis **Normes** "
+            "UNIQUEMENT s'il y a au moins une norme à citer (règle d) — rien après. "
+            "Une réponse sans bloc Normes est correcte.\n"
+        ) + baseline[baseline.index("   Si plusieurs variantes"):]
 
     def test_v1_system_prompt_still_forbids_signalling_an_absent_info(self) -> None:
         from app.services.chat.prompts import system_prompt_for
@@ -243,3 +249,83 @@ class TestNormesBlockByMode:
 
         assert get_ouvrage_instruction(self.NO_MATCH, "baseline") == ""
         assert get_ouvrage_instruction(self.NO_MATCH, "v1") == ""
+
+
+class TestNormesBlockOptionalInV1:
+    """In v1 no prompt text presents the final Normes block as mandatory."""
+
+    OLD_ORDER_LINE = "**Localisation** puis **Normes** — rien après"
+    V1_ORDER_LINE = (
+        "   ORDRE STRICT en fin de réponse : **Localisation**, puis **Normes** "
+        "UNIQUEMENT s'il y a au moins une norme à citer (règle d) — rien après. "
+        "Une réponse sans bloc Normes est correcte.\n"
+    )
+    OLD_PARENTHESIS = "(avant Normes)"
+    V1_PARENTHESIS = "(avant le bloc Normes s'il y en a un)"
+
+    def test_v1_system_prompt_no_longer_contains_the_old_order_line(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert self.OLD_ORDER_LINE not in system_prompt_for("v1")
+
+    def test_v1_system_prompt_carries_the_full_v1_order_line(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert self.V1_ORDER_LINE in system_prompt_for("v1")
+
+    def test_v1_localisation_instruction_no_longer_contains_the_old_parenthesis(self) -> None:
+        from app.services.chat.prompts import localisation_instruction_for
+
+        assert self.OLD_PARENTHESIS not in localisation_instruction_for("v1")
+
+    def test_v1_localisation_instruction_carries_the_conditional_parenthesis(self) -> None:
+        from app.services.chat.prompts import localisation_instruction_for
+
+        assert self.V1_PARENTHESIS in localisation_instruction_for("v1")
+
+    def test_baseline_localisation_instruction_has_the_historical_sha256(self) -> None:
+        import hashlib
+
+        from app.services.chat.prompts import localisation_instruction_for
+
+        digest = hashlib.sha256(localisation_instruction_for("baseline").encode("utf-8")).hexdigest()
+        assert digest == "dbbf8abbd1f2a6180e3f712f34c7cc7498f4cc1a771ea9367caa899d83ef5300"
+
+    def test_v1_rule_d_is_served_unchanged_up_to_the_order_line(self) -> None:
+        import hashlib
+
+        from app.services.chat.prompts import system_prompt_for
+
+        v1 = system_prompt_for("v1")
+        rule_d = v1[v1.index("   d) "):v1.index("   ORDRE STRICT")]
+        assert len(rule_d) == 448
+        assert (
+            hashlib.sha256(rule_d.encode("utf-8")).hexdigest()
+            == "8081409d5ae90fea0d72f8a234376bc2056986224c2028c1f703542b3d9b4ef4"
+        )
+
+    def test_v1_localisation_instruction_differs_from_baseline_only_by_the_parenthesis(
+        self,
+    ) -> None:
+        from app.services.chat.prompts import localisation_instruction_for
+
+        baseline = localisation_instruction_for("baseline")
+        v1 = localisation_instruction_for("v1")
+        assert baseline.count(self.OLD_PARENTHESIS) == 1
+        assert v1.count(self.V1_PARENTHESIS) == 1
+        assert v1.split(self.V1_PARENTHESIS) == baseline.split(self.OLD_PARENTHESIS)
+
+    def test_baseline_system_prompt_still_contains_the_old_order_line(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert self.OLD_ORDER_LINE in system_prompt_for("baseline")
+
+    def test_v1_localisation_instruction_keeps_dropping_the_block_without_precise_location(
+        self,
+    ) -> None:
+        from app.services.chat.prompts import localisation_instruction_for
+
+        assert (
+            "Si aucune localisation PRÉCISE n'est dans le contexte, ne mets pas ce bloc"
+            in localisation_instruction_for("v1")
+        )

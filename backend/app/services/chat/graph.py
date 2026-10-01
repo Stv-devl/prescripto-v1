@@ -38,22 +38,33 @@ from app.services import project as project_service
 from app.services import search as search_service
 from app.services.chat import conversation as conversation_mod
 from app.services.chat.chunk_enrichment import enrich_with_dpgf_quantities, expand_heading_chunks
+from app.services.chat.context_budget import render_context_parts, select_by_score
+from app.services.chat.context_dedup import render_merged_context
 from app.services.chat.context_enrichment import build_db_context
+from app.services.chat.model_routing import Price, price_for, short_call_model
 from app.services.chat.prompts import (
     CONTEXT_MAX_CHARS,
     FORCED_SCHEMA_RE,
     FORCED_SCORE_FLOOR,
     HISTORY_WINDOW,
-    LOCALISATION_INSTRUCTION,
     MAX_DISPLAYED_SOURCES,
     MIN_SOURCE_TEXT_LENGTH,
     classify_scope,
     get_forced_related,
     get_ouvrage_instruction,
+    localisation_instruction_for,
     system_prompt_for,
 )
 from app.services.chat.query_rewrite import rewrite_query
 from app.services.chat.schema_extraction import enrich_schema_with_search, extract_schema
+from app.services.chat.search_limits import narrow_search_limit, query_limits
+from app.services.chat.sufficiency import (
+    judge_sufficiency,
+    merge_results,
+    reformulate,
+    should_judge,
+    should_retry,
+)
 from app.services.chat.table_extraction import extract_table
 
 configure_langsmith(settings)
@@ -71,25 +82,53 @@ _LOCALIZATION_RE = re.compile(r"(?:au droit|localisation\s*:)[^\n]*", re.IGNOREC
 _NUMBERS_RE = re.compile(r"[\d.,]+\s*(?:m[²³23]?|ml|kg|l)\b")
 
 
-def _usage_leg(usage: UsageInfo | None) -> dict[str, int | float]:
-    """Token counts and USD cost for one Mistral call, zeroed if none was made."""
+def _usage_leg(
+    usage: UsageInfo | None, price: Price = MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
+) -> dict[str, int | float]:
+    """Token counts and USD cost for one Mistral call at `price`, zeroed if none was made."""
     input_tokens = usage.prompt_tokens or 0 if usage else 0
     output_tokens = usage.completion_tokens or 0 if usage else 0
-    price = MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
     cost_usd = (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
     return {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd}
 
 
-def _usage_event(rewrite: UsageInfo | None, generation: UsageInfo | None) -> dict[str, object]:
-    """Build the {rewrite, generation, total} usage payload for the SSE stream."""
-    rewrite_leg = _usage_leg(rewrite)
-    generation_leg = _usage_leg(generation)
-    total = {
-        "input_tokens": rewrite_leg["input_tokens"] + generation_leg["input_tokens"],
-        "output_tokens": rewrite_leg["output_tokens"] + generation_leg["output_tokens"],
-        "cost_usd": rewrite_leg["cost_usd"] + generation_leg["cost_usd"],
+def _sum_legs(legs: list[dict[str, int | float]]) -> dict[str, int | float]:
+    return {
+        "input_tokens": sum(leg["input_tokens"] for leg in legs),
+        "output_tokens": sum(leg["output_tokens"] for leg in legs),
+        "cost_usd": sum(leg["cost_usd"] for leg in legs),
     }
-    return {"rewrite": rewrite_leg, "generation": generation_leg, "total": total}
+
+
+def _usage_event(
+    rewrite: UsageInfo | None,
+    generation: UsageInfo | None,
+    agent: list[UsageInfo] | None = None,
+    *,
+    short_call_price: Price | None = None,
+    rewrite_price: Price | None = None,
+) -> dict[str, object]:
+    """Build the {rewrite, generation, [agent,] total} usage payload for the SSE stream.
+
+    `agent` (judge + reformulation calls) is passed in v1 only; without it the payload
+    keeps its three-key baseline shape. `short_call_price` prices the agent legs (the fast
+    model in v1) and, unless `rewrite_price` is given, the rewrite leg; generation is always
+    priced as mistral-large.
+    """
+    short_price = short_call_price or MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
+    rewrite_leg = _usage_leg(rewrite, rewrite_price or short_price)
+    generation_leg = _usage_leg(generation)
+    if agent is None:
+        total = _sum_legs([rewrite_leg, generation_leg])
+        return {"rewrite": rewrite_leg, "generation": generation_leg, "total": total}
+    agent_leg = _sum_legs([_usage_leg(usage, short_price) for usage in agent])
+    total = _sum_legs([rewrite_leg, generation_leg, agent_leg])
+    return {
+        "rewrite": rewrite_leg,
+        "generation": generation_leg,
+        "agent": agent_leg,
+        "total": total,
+    }
 
 
 def _normalize_for_dedup(text: str) -> str:
@@ -161,7 +200,9 @@ async def _run_search(
 
     forced_queries = get_forced_related(search_query)
 
-    main_limit = max(search_limit, len(main_queries) * 5)
+    main_limit, forced_limit = query_limits(
+        search_limit, main_queries=len(main_queries), forced_queries=len(forced_queries)
+    )
     search_results = await search_service.search_merged(
         tenant_id=tenant_id,
         project_id=project_id,
@@ -176,7 +217,7 @@ async def _run_search(
             project_id=project_id,
             queries=forced_queries,
             filters=SearchFilters(),
-            limit=max(search_limit, len(forced_queries) * 5),
+            limit=forced_limit,
             score_threshold=0.30,
         )
         main_texts = {sr.text[:200] for sr in search_results}
@@ -228,24 +269,30 @@ def _build_context_and_sources(
     multiple_lots = len(lot_groups) > 1
     included_chunks: list[SearchResult] = []
 
-    for lot_key in sorted(lot_groups.keys()):
-        if context_full:
-            break
-        if multiple_lots:
-            separator = f"\n=== {lot_key} ===\n"
-            if total_chars + len(separator) > context_max:
+    if settings.retrieval_mode == "v1":
+        included_chunks = select_by_score(
+            valid_chunks, context_max=context_max, multiple_lots=multiple_lots
+        )
+        context_parts = render_context_parts(included_chunks, multiple_lots=multiple_lots)
+    else:
+        for lot_key in sorted(lot_groups.keys()):
+            if context_full:
                 break
-            context_parts.append(separator)
-            total_chars += len(separator)
+            if multiple_lots:
+                separator = f"\n=== {lot_key} ===\n"
+                if total_chars + len(separator) > context_max:
+                    break
+                context_parts.append(separator)
+                total_chars += len(separator)
 
-        for sr in lot_groups[lot_key]:
-            chunk_text = f"[{sr.filename}, p.{sr.page}]\n{sr.text}"
-            if total_chars + len(chunk_text) > context_max:
-                context_full = True
-                break
-            context_parts.append(chunk_text)
-            total_chars += len(chunk_text)
-            included_chunks.append(sr)
+            for sr in lot_groups[lot_key]:
+                chunk_text = f"[{sr.filename}, p.{sr.page}]\n{sr.text}"
+                if total_chars + len(chunk_text) > context_max:
+                    context_full = True
+                    break
+                context_parts.append(chunk_text)
+                total_chars += len(chunk_text)
+                included_chunks.append(sr)
 
     seen_source_keys: dict[tuple[uuid.UUID, int], int] = {}
     source_chunks: dict[int, list[tuple[int, str]]] = {}
@@ -292,7 +339,12 @@ def _build_context_and_sources(
         sources[idx].text = "\n\n".join(text for _, text in chunks)
 
     sources = sources[:max_sources]
-    context_block = "\n---\n".join(context_parts)
+    merged = (
+        render_merged_context(included_chunks, multiple_lots=multiple_lots)
+        if settings.retrieval_mode == "v1"
+        else None
+    )
+    context_block = merged if merged is not None else "\n---\n".join(context_parts)
     return context_block, sources
 
 
@@ -335,7 +387,7 @@ def _build_mistral_messages(
             "3-5 phrases synthétiques, pas de développement par lot/ouvrage."
         )
     else:
-        system_content += LOCALISATION_INSTRUCTION
+        system_content += localisation_instruction_for(settings.retrieval_mode)
     system_content += get_ouvrage_instruction(question, settings.retrieval_mode)
 
     has_table = bool(structured == "table" and context_block)
@@ -408,6 +460,10 @@ class ChatState(TypedDict, total=False):
     table: StructuredTable | None
     schema_result: StructuredSchema | None
     error: str | None
+    judgment_missing: str | None
+    retry_query: str | None
+    retried: bool
+    agent_usage: list[UsageInfo]
 
 
 def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUID) -> object:
@@ -430,7 +486,7 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
             structured = "none"
             schema_flag = "none"
         else:
-            search_limit = 20
+            search_limit = narrow_search_limit(settings.retrieval_mode, settings.v1_search_limit)
             context_max = CONTEXT_MAX_CHARS
             score_threshold = 0.40
             max_sources = MAX_DISPLAYED_SOURCES
@@ -545,6 +601,44 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
                 )
         return {"schema_result": schema}
 
+    @traceable(name="judge_node")
+    async def judge_node(state: ChatState) -> dict[str, object]:
+        agent_usage = list(state.get("agent_usage") or [])
+        judgment = await judge_sufficiency(
+            state["question"], state["context_block"], usage_sink=agent_usage
+        )
+        retry_query: str | None = None
+        if should_retry(judgment, retried=state.get("retried", False)):
+            retry_query = await reformulate(
+                state["question"],
+                judgment.missing,
+                first_query=state["search_query"] or state["question"],
+                usage_sink=agent_usage,
+            )
+        return {
+            "judgment_missing": None if judgment.sufficient else judgment.missing,
+            "retry_query": retry_query,
+            "agent_usage": agent_usage,
+        }
+
+    @traceable(name="retry_search_node")
+    async def retry_search_node(state: ChatState) -> dict[str, object]:
+        retry_query = state["retry_query"] or state["question"]
+        try:
+            second = await _run_search(
+                tenant_id=tenant_id,
+                project_id=project_id,
+                search_query=retry_query,
+                question=retry_query,
+                related_queries=[],
+                scope="specific",
+                search_limit=narrow_search_limit(settings.retrieval_mode, settings.v1_search_limit),
+            )
+        except Exception:
+            logger.exception("Retry search failed, serving the first search results")
+            return {"retried": True}
+        return {"search_results": merge_results(state["search_results"], second), "retried": True}
+
     async def error_node(state: ChatState) -> dict[str, object]:
         writer = get_stream_writer()
         writer({"error": state["error"]})
@@ -574,6 +668,7 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
                     "schema": schema,
                     "rewrite_usage": state.get("rewrite_usage"),
                     "generation_usage": state.get("generation_usage"),
+                    "agent_usage": state.get("agent_usage"),
                 }
             }
         )
@@ -582,13 +677,27 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     def _route_after_search(state: ChatState) -> str:
         return "error_node" if state.get("error") else "enrich_node"
 
-    def _route_after_enrich(state: ChatState) -> list[str]:
+    def _generation_targets(state: ChatState) -> list[str]:
         targets = ["generate_node"]
         if state["structured"] == "table" and state["context_block"]:
             targets.append("extract_table_node")
         if state["schema_flag"] == "schema" and state["context_block"]:
             targets.append("extract_schema_node")
         return targets
+
+    def _route_after_enrich(state: ChatState) -> list[str]:
+        needs_judge = should_judge(
+            settings.retrieval_mode,
+            state["scope"],
+            has_query=state["search_query"] is not None,
+            retried=state.get("retried", False),
+        )
+        return ["judge_node"] if needs_judge else _generation_targets(state)
+
+    def _route_after_judge(state: ChatState) -> list[str]:
+        return ["retry_search_node"] if state.get("retry_query") else _generation_targets(state)
+
+    generation_targets = ["generate_node", "extract_table_node", "extract_schema_node"]
 
     builder = StateGraph(ChatState)
     builder.add_node("rewrite_node", rewrite_node)
@@ -597,6 +706,8 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     builder.add_node("generate_node", generate_node)
     builder.add_node("extract_table_node", extract_table_node)
     builder.add_node("extract_schema_node", extract_schema_node)
+    builder.add_node("judge_node", judge_node)
+    builder.add_node("retry_search_node", retry_search_node)
     builder.add_node("error_node", error_node)
     builder.add_node("join_node", join_node)
 
@@ -604,10 +715,12 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     builder.add_edge("rewrite_node", "search_node")
     builder.add_conditional_edges("search_node", _route_after_search, ["error_node", "enrich_node"])
     builder.add_conditional_edges(
-        "enrich_node",
-        _route_after_enrich,
-        ["generate_node", "extract_table_node", "extract_schema_node"],
+        "enrich_node", _route_after_enrich, ["judge_node", *generation_targets]
     )
+    builder.add_conditional_edges(
+        "judge_node", _route_after_judge, ["retry_search_node", *generation_targets]
+    )
+    builder.add_edge("retry_search_node", "enrich_node")
     builder.add_edge("generate_node", "join_node")
     builder.add_edge("extract_table_node", "join_node")
     builder.add_edge("extract_schema_node", "join_node")
@@ -694,6 +807,19 @@ async def chat_stream(
     db.add(assistant_msg)
     await db.commit()
 
-    usage_event = _usage_event(final_payload["rewrite_usage"], final_payload["generation_usage"])  # type: ignore[arg-type]
+    agent_usage: list[UsageInfo] | None = None
+    short_call_price: Price | None = None
+    rewrite_price: Price | None = None
+    if settings.retrieval_mode == "v1":
+        agent_usage = final_payload["agent_usage"] or []  # type: ignore[assignment]
+        short_call_price = price_for(short_call_model("v1", settings.v1_fast_model))
+        rewrite_price = price_for(short_call_model("v1", settings.v1_rewrite_model))
+    usage_event = _usage_event(
+        final_payload["rewrite_usage"],  # type: ignore[arg-type]
+        final_payload["generation_usage"],  # type: ignore[arg-type]
+        agent_usage,
+        short_call_price=short_call_price,
+        rewrite_price=rewrite_price,
+    )
     yield f"data: {json.dumps({'usage': usage_event})}\n\n"
     yield "data: [DONE]\n\n"
