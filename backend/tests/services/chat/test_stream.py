@@ -277,3 +277,112 @@ class TestNormesBlockOptionalAssembled:
         assert "PAS de bloc Localisation ni Normes pour les questions générales" in content
         assert self.OLD_PARENTHESIS not in content
         assert self.V1_PARENTHESIS not in content
+
+
+class TestStreamContextMergesArticleCopies:
+    """j2-contexte-dedup-articles: the legacy builder merges article copies like the graph one."""
+
+    import uuid
+
+    import pytest
+
+    from app.schemas.search import SearchResult
+
+    BODY = (
+        "Réglementation thermique\n"
+        "Le bâtiment doit respecter la RT 2012 pour l'ensemble des locaux chauffés du lot."
+    )
+    A1 = "1.1.3.9. " + BODY
+    A4 = "4.1.3.11. " + BODY
+    X = (
+        "2.3.1.1. Enduit monocouche\n"
+        "Enduit monocouche gratté de teinte claire sur l'ensemble des façades de la maison."
+    )
+    SHARED_SENTENCE = "Le bâtiment doit respecter la RT 2012"
+    DOC_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+    PROJECT_ID = uuid.UUID("22222222-2222-2222-2222-222222222222")
+
+    def _chunk(self, text: str, *, page: int, lot: str, score: float) -> SearchResult:
+        from app.schemas.search import SearchResult
+
+        return SearchResult(
+            text=text,
+            page=page,
+            position=0,
+            filename="CCTP.pdf",
+            document_id=self.DOC_ID,
+            project_id=self.PROJECT_ID,
+            score=score,
+            lot=lot,
+            phase="PRO",
+            type="CCTP",
+        )
+
+    def test_v1_stream_context_contains_a_copied_paragraph_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two copies differing by their article number are rendered once, under a merged header."""
+        from app.services.chat.stream import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        context, _ = _build_context_and_sources(
+            [
+                self._chunk(self.A1, page=5, lot="01", score=0.9),
+                self._chunk(self.A4, page=46, lot="04", score=0.5),
+            ],
+            score_threshold=0.40,
+            context_max=20000,
+            max_sources=5,
+        )
+        assert context.count(self.SHARED_SENTENCE) == 1
+        assert "[CCTP.pdf, p.5 ; aussi : CCTP.pdf, p.46]" in context
+
+    def test_baseline_stream_context_is_byte_identical_to_the_unmerged_render(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Baseline never merges: both copies, historical headers and separators."""
+        from app.services.chat.stream import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+        context, _ = _build_context_and_sources(
+            [
+                self._chunk(self.A1, page=5, lot="01", score=0.9),
+                self._chunk(self.A4, page=46, lot="04", score=0.5),
+            ],
+            score_threshold=0.40,
+            context_max=20000,
+            max_sources=5,
+        )
+        assert context == (
+            "\n=== 01 ===\n"
+            + "\n---\n"
+            + "[CCTP.pdf, p.5]\n"
+            + self.A1
+            + "\n---\n"
+            + "\n=== 04 ===\n"
+            + "\n---\n"
+            + "[CCTP.pdf, p.46]\n"
+            + self.A4
+        )
+
+    def test_graph_and_stream_build_the_same_v1_context_from_the_same_results(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both builders render the same merged context and sources above both thresholds."""
+        from app.services.chat import graph, stream
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        results = [
+            self._chunk(self.A1, page=5, lot="01", score=0.9),
+            self._chunk(self.A4, page=46, lot="04", score=0.6),
+            self._chunk(self.X, page=50, lot="04", score=0.7),
+        ]
+        graph_context, graph_sources = graph._build_context_and_sources(
+            results, score_threshold=0.40, context_max=20000, max_sources=5
+        )
+        stream_context, stream_sources = stream._build_context_and_sources(
+            results, score_threshold=0.40, context_max=20000, max_sources=5
+        )
+        assert stream_context == graph_context
+        assert stream_sources == graph_sources
+        assert graph_context.count(self.SHARED_SENTENCE) == 1

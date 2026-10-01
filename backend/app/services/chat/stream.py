@@ -27,6 +27,7 @@ from app.services.chat.chunk_enrichment import (
     enrich_with_dpgf_quantities,
     expand_heading_chunks,
 )
+from app.services.chat.context_dedup import render_merged_context
 from app.services.chat.context_enrichment import build_db_context
 from app.services.chat.prompts import (
     CONTEXT_MAX_CHARS,
@@ -570,7 +571,12 @@ def _build_context_and_sources(
 
     sources = sources[:max_sources]
 
-    context_block = "\n---\n".join(context_parts)
+    merged = (
+        render_merged_context(included_chunks, multiple_lots=multiple_lots)
+        if settings.retrieval_mode == "v1"
+        else None
+    )
+    context_block = merged if merged is not None else "\n---\n".join(context_parts)
     return context_block, sources
 
 

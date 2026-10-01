@@ -39,6 +39,7 @@ from app.models.message import Message
 from app.models.project import Project
 from app.models.tenant import Tenant
 from app.models.user import User
+from app.schemas.search import SearchResult
 from app.services import project as project_service
 from app.services.chat.prompts import REWRITE_PROMPT, SCHEMA_EXTRACTION_PROMPT, TABLE_EXTRACTION_PROMPT
 from tests.fakes import FakePoint, FakeQdrant
@@ -911,3 +912,186 @@ class TestNormesBlockOptionalAssembled:
         assert "PAS de bloc Localisation ni Normes pour les questions générales" in content
         assert self.OLD_PARENTHESIS not in content
         assert self.V1_PARENTHESIS not in content
+
+
+class TestGraphContextMergesArticleCopies:
+    """j2-contexte-dedup-articles: a paragraph copied across lots reaches the v1 model once."""
+
+    import pytest
+
+    BODY = (
+        "Réglementation thermique\n"
+        "Le bâtiment doit respecter la RT 2012 pour l'ensemble des locaux chauffés du lot."
+    )
+    A1 = "1.1.3.9. " + BODY
+    A4 = "4.1.3.11. " + BODY
+    X = (
+        "2.3.1.1. Enduit monocouche\n"
+        "Enduit monocouche gratté de teinte claire sur l'ensemble des façades de la maison."
+    )
+    SHARED_SENTENCE = "Le bâtiment doit respecter la RT 2012"
+    DOC_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+    PROJECT_ID = uuid.UUID("22222222-2222-2222-2222-222222222222")
+
+    def _chunk(
+        self, text: str, *, page: int, lot: str, score: float, position: int = 0
+    ) -> "SearchResult":
+        from app.schemas.search import SearchResult
+
+        return SearchResult(
+            text=text,
+            page=page,
+            position=position,
+            filename="CCTP.pdf",
+            document_id=self.DOC_ID,
+            project_id=self.PROJECT_ID,
+            score=score,
+            lot=lot,
+            phase="PRO",
+            type="CCTP",
+        )
+
+    def _copies(self) -> list["SearchResult"]:
+        return [
+            self._chunk(self.A1, page=5, lot="01", score=0.9),
+            self._chunk(self.A4, page=46, lot="04", score=0.5),
+        ]
+
+    def test_v1_graph_context_contains_a_copied_paragraph_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two copies differing by their article number are rendered once, under a merged header."""
+        from app.services.chat.graph import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        context, _ = _build_context_and_sources(
+            self._copies(), score_threshold=0.40, context_max=20000, max_sources=5
+        )
+        assert context.count(self.SHARED_SENTENCE) == 1
+        assert "[CCTP.pdf, p.5 ; aussi : CCTP.pdf, p.46]" in context
+
+    def test_v1_graph_sources_are_unchanged_by_the_merge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The merge only touches the context text: both copies stay in the sources."""
+        from app.schemas.chat import Source
+        from app.services.chat.graph import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        _, sources = _build_context_and_sources(
+            self._copies(), score_threshold=0.40, context_max=20000, max_sources=5
+        )
+        assert sources == [
+            Source(
+                document_id=self.DOC_ID,
+                filename="CCTP.pdf",
+                page=5,
+                lot="01",
+                phase="PRO",
+                text=self.A1,
+                section_title=None,
+            ),
+            Source(
+                document_id=self.DOC_ID,
+                filename="CCTP.pdf",
+                page=46,
+                lot="04",
+                phase="PRO",
+                text=self.A4,
+                section_title=None,
+            ),
+        ]
+
+    def test_baseline_graph_context_and_sources_are_byte_identical_to_the_unmerged_render(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Baseline never merges: both copies, historical headers and separators."""
+        from app.schemas.chat import Source
+        from app.services.chat.graph import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+        context, sources = _build_context_and_sources(
+            self._copies(), score_threshold=0.40, context_max=20000, max_sources=5
+        )
+        assert context == (
+            "\n=== 01 ===\n"
+            + "\n---\n"
+            + "[CCTP.pdf, p.5]\n"
+            + self.A1
+            + "\n---\n"
+            + "\n=== 04 ===\n"
+            + "\n---\n"
+            + "[CCTP.pdf, p.46]\n"
+            + self.A4
+        )
+        assert sources == [
+            Source(
+                document_id=self.DOC_ID,
+                filename="CCTP.pdf",
+                page=5,
+                lot="01",
+                phase="PRO",
+                text=self.A1,
+                section_title=None,
+            ),
+            Source(
+                document_id=self.DOC_ID,
+                filename="CCTP.pdf",
+                page=46,
+                lot="04",
+                phase="PRO",
+                text=self.A4,
+                section_title=None,
+            ),
+        ]
+
+    def test_v1_graph_context_without_copies_is_byte_identical_to_the_unmerged_render(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With nothing to merge, the v1 context is the historical render."""
+        from app.services.chat.graph import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        context, _ = _build_context_and_sources(
+            [
+                self._chunk(self.A1, page=5, lot="01", score=0.9),
+                self._chunk(self.X, page=50, lot="04", score=0.5),
+            ],
+            score_threshold=0.40,
+            context_max=20000,
+            max_sources=5,
+        )
+        assert context == (
+            "\n=== 01 ===\n"
+            + "\n---\n"
+            + "[CCTP.pdf, p.5]\n"
+            + self.A1
+            + "\n---\n"
+            + "\n=== 04 ===\n"
+            + "\n---\n"
+            + "[CCTP.pdf, p.50]\n"
+            + self.X
+        )
+
+    def test_v1_graph_merge_never_admits_a_passage_that_did_not_fit_the_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The room freed by a merge is not refilled: the passage left out stays out."""
+        from app.services.chat.graph import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        context_max = (
+            len("[CCTP.pdf, p.5]\n" + self.A1) + len("[CCTP.pdf, p.46]\n" + self.A4) + 10
+        )
+        context, _ = _build_context_and_sources(
+            [
+                self._chunk(self.A1, page=5, lot="01", score=0.9, position=0),
+                self._chunk(self.A4, page=46, lot="01", score=0.5, position=1),
+                self._chunk(self.X, page=50, lot="01", score=0.4, position=2),
+            ],
+            score_threshold=0.40,
+            context_max=context_max,
+            max_sources=5,
+        )
+        assert "Enduit monocouche gratté" not in context
+        assert context.count(self.SHARED_SENTENCE) == 1
