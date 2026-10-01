@@ -137,3 +137,142 @@ def test_v1_context_max_bound_still_applies_and_drops_what_does_not_fit(
     assert "FIRST-CHUNK" in context
     assert "SECOND-CHUNK" not in context
     assert len(context) <= 500
+
+
+HEAD = "HEAD-PASSAGE " + "a" * 87
+MIDDLE = "MIDDLE-PASSAGE " + "b" * 85
+END = "END-PASSAGE " + "c" * 88
+PART_LENGTH = len("[cctp.pdf, p.1]\n") + 100
+
+
+def _passage(text: str, *, score: float, page: int, position: int, lot: str = "02") -> SearchResult:
+    return SearchResult(
+        text=text,
+        page=page,
+        position=position,
+        filename="cctp.pdf",
+        document_id=DOCUMENT_ID,
+        project_id=PROJECT_ID,
+        score=score,
+        lot=lot,
+        phase="PRO",
+        type="CCTP",
+    )
+
+
+def _head_middle_end() -> list[SearchResult]:
+    return [
+        _passage(HEAD, score=0.45, page=1, position=0),
+        _passage(MIDDLE, score=0.6, page=2, position=1),
+        _passage(END, score=0.9, page=3, position=2),
+    ]
+
+
+def test_v1_cut_keeps_the_best_scored_passage_at_the_end_of_the_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    assert len(HEAD) == len(MIDDLE) == len(END) == 100 and PART_LENGTH == 116
+
+    context, _ = _build_context_and_sources(
+        _head_middle_end(), score_threshold=0.40, context_max=237, max_sources=10
+    )
+
+    assert context == "[cctp.pdf, p.2]\n" + MIDDLE + "\n---\n" + "[cctp.pdf, p.3]\n" + END
+
+
+def test_v1_sources_follow_the_retained_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+
+    _, sources = _build_context_and_sources(
+        _head_middle_end(), score_threshold=0.40, context_max=237, max_sources=10
+    )
+
+    assert [(s.filename, s.page) for s in sources] == [("cctp.pdf", 2), ("cctp.pdf", 3)]
+
+
+def test_v1_rendered_context_never_exceeds_context_max_counting_the_joins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+
+    context, _ = _build_context_and_sources(
+        _head_middle_end(), score_threshold=0.40, context_max=348, max_sources=10
+    )
+
+    assert len(context) <= 348
+    assert "HEAD-PASSAGE" not in context
+    assert "END-PASSAGE" in context
+
+
+def test_v1_rendered_context_with_merged_copies_stays_within_context_max(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    body = (
+        "Réglementation thermique\n"
+        "Le bâtiment doit respecter la RT 2012 pour l'ensemble des locaux chauffés du lot."
+    )
+    results = [
+        _passage("1.1.3.9. " + body, score=0.9, page=5, position=0, lot="01"),
+        _passage("4.1.3.11. " + body, score=0.6, page=46, position=0, lot="04"),
+        _passage(END, score=0.7, page=50, position=1, lot="04"),
+    ]
+
+    context, _ = _build_context_and_sources(
+        results, score_threshold=0.40, context_max=300, max_sources=10
+    )
+
+    assert len(context) <= 300
+    assert "Le bâtiment doit respecter la RT 2012" in context
+
+
+def test_baseline_cut_still_fills_in_document_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+
+    context, sources = _build_context_and_sources(
+        _head_middle_end(), score_threshold=0.40, context_max=237, max_sources=10
+    )
+
+    assert context == "[cctp.pdf, p.1]\n" + HEAD + "\n---\n" + "[cctp.pdf, p.2]\n" + MIDDLE
+    assert [(s.filename, s.page) for s in sources] == [("cctp.pdf", 1), ("cctp.pdf", 2)]
+
+
+def test_v1_context_is_unchanged_when_everything_fits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+
+    context, sources = _build_context_and_sources(
+        _head_middle_end(), score_threshold=0.40, context_max=20000, max_sources=10
+    )
+
+    assert context == (
+        "[cctp.pdf, p.1]\n"
+        + HEAD
+        + "\n---\n"
+        + "[cctp.pdf, p.2]\n"
+        + MIDDLE
+        + "\n---\n"
+        + "[cctp.pdf, p.3]\n"
+        + END
+    )
+    assert [(s.filename, s.page) for s in sources] == [
+        ("cctp.pdf", 1),
+        ("cctp.pdf", 2),
+        ("cctp.pdf", 3),
+    ]
+
+
+def test_v1_keeps_the_lot_separator_when_a_single_lot_survives_the_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    results = [
+        _passage(END, score=0.9, page=3, position=2, lot="01"),
+        _passage(HEAD, score=0.45, page=1, position=0, lot="04"),
+    ]
+
+    context, _ = _build_context_and_sources(
+        results, score_threshold=0.40, context_max=200, max_sources=10
+    )
+
+    assert context == "\n=== 01 ===\n" + "\n---\n" + "[cctp.pdf, p.3]\n" + END

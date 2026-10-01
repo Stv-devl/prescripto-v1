@@ -386,3 +386,72 @@ class TestStreamContextMergesArticleCopies:
         assert stream_context == graph_context
         assert stream_sources == graph_sources
         assert graph_context.count(self.SHARED_SENTENCE) == 1
+
+
+class TestStreamContextBudgetByScore:
+    """j2-budget-ordre-score: under a cut, v1 keeps the best-scored passages on both paths."""
+
+    import uuid
+
+    import pytest
+
+    from app.schemas.search import SearchResult
+
+    HEAD = "HEAD-PASSAGE " + "a" * 87
+    MIDDLE = "MIDDLE-PASSAGE " + "b" * 85
+    END = "END-PASSAGE " + "c" * 88
+
+    def _results(self) -> list["SearchResult"]:
+        from app.schemas.search import SearchResult
+
+        return [
+            SearchResult(
+                text=text,
+                page=page,
+                position=position,
+                filename="cctp.pdf",
+                document_id=self.uuid.UUID("11111111-1111-1111-1111-111111111111"),
+                project_id=self.uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                score=score,
+                lot="02",
+                phase="PRO",
+                type="CCTP",
+            )
+            for text, score, page, position in [
+                (self.HEAD, 0.45, 1, 0),
+                (self.MIDDLE, 0.6, 2, 1),
+                (self.END, 0.9, 3, 2),
+            ]
+        ]
+
+    def test_graph_and_stream_build_the_same_v1_context_when_the_budget_cuts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both builders keep the same best-scored passages and sources under a cut."""
+        from app.services.chat import graph, stream
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+        graph_context, graph_sources = graph._build_context_and_sources(
+            self._results(), score_threshold=0.40, context_max=237, max_sources=5
+        )
+        stream_context, stream_sources = stream._build_context_and_sources(
+            self._results(), score_threshold=0.40, context_max=237, max_sources=5
+        )
+        assert stream_context == graph_context
+        assert stream_sources == graph_sources
+        assert "END-PASSAGE" in stream_context
+
+    def test_stream_baseline_cut_still_fills_in_document_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Baseline keeps filling in document order: the end of the document is cut."""
+        from app.services.chat.stream import _build_context_and_sources
+
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+        context, sources = _build_context_and_sources(
+            self._results(), score_threshold=0.40, context_max=237, max_sources=5
+        )
+        assert context == (
+            "[cctp.pdf, p.1]\n" + self.HEAD + "\n---\n" + "[cctp.pdf, p.2]\n" + self.MIDDLE
+        )
+        assert [(s.filename, s.page) for s in sources] == [("cctp.pdf", 1), ("cctp.pdf", 2)]

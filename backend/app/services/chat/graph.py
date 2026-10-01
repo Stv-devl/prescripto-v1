@@ -38,6 +38,7 @@ from app.services import project as project_service
 from app.services import search as search_service
 from app.services.chat import conversation as conversation_mod
 from app.services.chat.chunk_enrichment import enrich_with_dpgf_quantities, expand_heading_chunks
+from app.services.chat.context_budget import render_context_parts, select_by_score
 from app.services.chat.context_dedup import render_merged_context
 from app.services.chat.context_enrichment import build_db_context
 from app.services.chat.prompts import (
@@ -229,24 +230,30 @@ def _build_context_and_sources(
     multiple_lots = len(lot_groups) > 1
     included_chunks: list[SearchResult] = []
 
-    for lot_key in sorted(lot_groups.keys()):
-        if context_full:
-            break
-        if multiple_lots:
-            separator = f"\n=== {lot_key} ===\n"
-            if total_chars + len(separator) > context_max:
+    if settings.retrieval_mode == "v1":
+        included_chunks = select_by_score(
+            valid_chunks, context_max=context_max, multiple_lots=multiple_lots
+        )
+        context_parts = render_context_parts(included_chunks, multiple_lots=multiple_lots)
+    else:
+        for lot_key in sorted(lot_groups.keys()):
+            if context_full:
                 break
-            context_parts.append(separator)
-            total_chars += len(separator)
+            if multiple_lots:
+                separator = f"\n=== {lot_key} ===\n"
+                if total_chars + len(separator) > context_max:
+                    break
+                context_parts.append(separator)
+                total_chars += len(separator)
 
-        for sr in lot_groups[lot_key]:
-            chunk_text = f"[{sr.filename}, p.{sr.page}]\n{sr.text}"
-            if total_chars + len(chunk_text) > context_max:
-                context_full = True
-                break
-            context_parts.append(chunk_text)
-            total_chars += len(chunk_text)
-            included_chunks.append(sr)
+            for sr in lot_groups[lot_key]:
+                chunk_text = f"[{sr.filename}, p.{sr.page}]\n{sr.text}"
+                if total_chars + len(chunk_text) > context_max:
+                    context_full = True
+                    break
+                context_parts.append(chunk_text)
+                total_chars += len(chunk_text)
+                included_chunks.append(sr)
 
     seen_source_keys: dict[tuple[uuid.UUID, int], int] = {}
     source_chunks: dict[int, list[tuple[int, str]]] = {}

@@ -27,6 +27,7 @@ from app.services.chat.chunk_enrichment import (
     enrich_with_dpgf_quantities,
     expand_heading_chunks,
 )
+from app.services.chat.context_budget import render_context_parts, select_by_score
 from app.services.chat.context_dedup import render_merged_context
 from app.services.chat.context_enrichment import build_db_context
 from app.services.chat.prompts import (
@@ -487,36 +488,54 @@ def _build_context_and_sources(
     multiple_lots = len(lot_groups) > 1
     included_chunks: list[SearchResult] = []
 
-    for lot_key in sorted(lot_groups.keys()):
-        if context_full:
-            break
-        if multiple_lots:
-            separator = f"\n=== {lot_key} ===\n"
-            if total_chars + len(separator) > context_max:
-                logger.debug(
-                    f"[CONTEXT DEBUG] Context full at {total_chars} chars, {kept_count} chunks kept"
-                )
-                break
-            context_parts.append(separator)
-            total_chars += len(separator)
-
-        for sr in lot_groups[lot_key]:
-            chunk_text = f"[{sr.filename}, p.{sr.page}]\n{sr.text}"
-            if total_chars + len(chunk_text) > context_max:
-                logger.debug(
-                    f"[CONTEXT DEBUG] Context full at {total_chars} chars, {kept_count} chunks kept"
-                )
-                context_full = True
-                break
-            context_parts.append(chunk_text)
-            total_chars += len(chunk_text)
-            kept_count += 1
-            included_chunks.append(sr)
+    if settings.retrieval_mode == "v1":
+        included_chunks = select_by_score(
+            valid_chunks, context_max=context_max, multiple_lots=multiple_lots
+        )
+        context_parts = render_context_parts(included_chunks, multiple_lots=multiple_lots)
+        kept_count = len(included_chunks)
+        total_chars = len("\n---\n".join(context_parts))
+        for rank, sr in enumerate(included_chunks, start=1):
             logger.debug(
-                f"[CONTEXT DEBUG] chunk#{kept_count}: score={sr.score:.2f} lot='{lot_key}' "
+                f"[CONTEXT DEBUG] chunk#{rank}: score={sr.score:.2f} lot='{sr.lot or 'unknown'}' "
                 f"type={sr.type or '?'} file='{sr.filename}' p.{sr.page} "
                 f"— '{sr.text[:80].replace(chr(10), ' ')}'"
             )
+        logger.debug(
+            f"[CONTEXT DEBUG] Score-ordered budget: {kept_count} of {len(valid_chunks)} chunks "
+            f"kept, {total_chars} plain chars before article-copy merge"
+        )
+    else:
+        for lot_key in sorted(lot_groups.keys()):
+            if context_full:
+                break
+            if multiple_lots:
+                separator = f"\n=== {lot_key} ===\n"
+                if total_chars + len(separator) > context_max:
+                    logger.debug(
+                        f"[CONTEXT DEBUG] Context full at {total_chars} chars, {kept_count} chunks kept"
+                    )
+                    break
+                context_parts.append(separator)
+                total_chars += len(separator)
+
+            for sr in lot_groups[lot_key]:
+                chunk_text = f"[{sr.filename}, p.{sr.page}]\n{sr.text}"
+                if total_chars + len(chunk_text) > context_max:
+                    logger.debug(
+                        f"[CONTEXT DEBUG] Context full at {total_chars} chars, {kept_count} chunks kept"
+                    )
+                    context_full = True
+                    break
+                context_parts.append(chunk_text)
+                total_chars += len(chunk_text)
+                kept_count += 1
+                included_chunks.append(sr)
+                logger.debug(
+                    f"[CONTEXT DEBUG] chunk#{kept_count}: score={sr.score:.2f} lot='{lot_key}' "
+                    f"type={sr.type or '?'} file='{sr.filename}' p.{sr.page} "
+                    f"— '{sr.text[:80].replace(chr(10), ' ')}'"
+                )
 
     # ── Phase 4: Build sources (same logic) ──────────────────────
     seen_source_keys: dict[tuple[uuid.UUID, int], int] = {}

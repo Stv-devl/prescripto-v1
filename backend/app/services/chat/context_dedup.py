@@ -102,12 +102,24 @@ def render_merged_context(passages: Sequence[SearchResult], *, multiple_lots: bo
     if len(merged) == len(passages):
         return None
 
+    entries = [(passage.kept, passage_header(passage)) for passage in merged]
+    return "\n---\n".join(layout_context_parts(entries, multiple_lots=multiple_lots))
+
+
+def layout_context_parts(
+    entries: Sequence[tuple[SearchResult, str]], *, multiple_lots: bool
+) -> list[str]:
+    """Context parts of `(passage, header)` entries in order, to be joined by `\\n---\\n`.
+
+    The single copy of the builders' layout: a `=== lot ===` part whenever the passage's lot
+    changes (only if `multiple_lots`), then `header\\ntext` per passage.
+    """
     parts: list[str] = []
     previous_lot: str | None = None
-    for passage in merged:
-        lot_key = passage.kept.lot or "unknown"
+    for passage, header in entries:
+        lot_key = passage.lot or "unknown"
         if multiple_lots and lot_key != previous_lot:
             parts.append(f"\n=== {lot_key} ===\n")
             previous_lot = lot_key
-        parts.append(f"{passage_header(passage)}\n{passage.kept.text}")
-    return "\n---\n".join(parts)
+        parts.append(f"{header}\n{passage.text}")
+    return parts
