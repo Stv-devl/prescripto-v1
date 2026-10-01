@@ -1095,3 +1095,123 @@ class TestGraphContextMergesArticleCopies:
         )
         assert "Enduit monocouche gratté" not in context
         assert context.count(self.SHARED_SENTENCE) == 1
+
+
+class TestNarrowSearchLimit:
+    """j2-nombre-passages: the v1 narrow-scope search limit and its scaled per-query floor."""
+
+    import pytest
+
+    NARROW_QUESTION = "Quelle est l'épaisseur de la dalle du garage ?"
+    RELATED = ["liée 1", "liée 2", "liée 3", "liée 4"]
+    FORCED = [f"forcée {i}" for i in range(7)]
+
+    def _patch_search(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from app.schemas.search import SearchResult
+        from app.services import search as search_service
+        from app.services.chat import graph
+
+        forced = self.FORCED
+
+        async def _search_merged(*, queries: list[str], limit: int, **_: object) -> list[SearchResult]:
+            prefix = "forced" if queries == forced else "main"
+            return [
+                SearchResult(
+                    text=f"{prefix}-{i} passage de test",
+                    page=1,
+                    position=i,
+                    filename="cctp.pdf",
+                    document_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+                    project_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                    score=0.9,
+                    lot="02",
+                    phase="PRO",
+                    type="CCTP",
+                )
+                for i in range(limit)
+            ]
+
+        async def _expand(_tenant: object, _project: object, results: list[SearchResult]) -> list[SearchResult]:
+            return results
+
+        async def _enrich(
+            _tenant: object, _project: object, _query: object, _question: object, results: list[SearchResult]
+        ) -> list[SearchResult]:
+            return results
+
+        monkeypatch.setattr(search_service, "search_merged", _search_merged)
+        monkeypatch.setattr(graph, "expand_heading_chunks", _expand)
+        monkeypatch.setattr(graph, "enrich_with_dpgf_quantities", _enrich)
+        monkeypatch.setattr(graph, "get_forced_related", lambda _query: list(forced))
+
+    async def _count(self, monkeypatch: pytest.MonkeyPatch, search_limit: int) -> int:
+        from app.services.chat import graph
+
+        self._patch_search(monkeypatch)
+        results = await graph._run_search(
+            tenant_id=uuid.UUID("33333333-3333-3333-3333-333333333333"),
+            project_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+            search_query="épaisseur dalle garage",
+            question=self.NARROW_QUESTION,
+            related_queries=list(self.RELATED),
+            scope="specific",
+            search_limit=search_limit,
+        )
+        return len(results)
+
+    async def test_run_search_scales_main_and_forced_limits_at_10(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Six main and seven forced queries at 10: 12 + 14 results."""
+        assert await self._count(monkeypatch, 10) == 26
+
+    async def test_run_search_keeps_the_historical_limits_at_20(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """At 20 the limits are the historical max(20, n * 5): 30 + 35 results."""
+        assert await self._count(monkeypatch, 20) == 65
+
+    async def _recorded_limit(
+        self, db: AsyncSession, tenant: Tenant, monkeypatch: pytest.MonkeyPatch, mode: str
+    ) -> list[int]:
+        from app.services.chat import graph
+        from app.services.chat.prompts import classify_scope
+
+        assert classify_scope(self.NARROW_QUESTION) == "specific"
+        monkeypatch.setattr("app.core.config.settings.retrieval_mode", mode)
+        monkeypatch.setattr("app.core.config.settings.v1_search_limit", 10)
+        recorded: list[int] = []
+
+        async def _rewrite(
+            _question: str, _history: object, usage_sink: object = None
+        ) -> tuple[str, list[str], str, str, str]:
+            return ("épaisseur dalle garage", [], "specific", "none", "none")
+
+        async def _run_search(*, search_limit: int, **_: object) -> list[SearchResult]:
+            recorded.append(search_limit)
+            raise RuntimeError("search stopped by the test after recording its limit")
+
+        monkeypatch.setattr(graph, "rewrite_query", _rewrite)
+        monkeypatch.setattr(graph, "_run_search", _run_search)
+        project, user = await _project_and_user(db, tenant)
+        events = await _stream(
+            db,
+            tenant_id=tenant.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=self.NARROW_QUESTION,
+        )
+        assert events[-1] == "DONE"
+        return recorded
+
+    async def test_v1_narrow_search_uses_the_configured_limit(
+        self, db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under v1 the narrow-scope search receives the configured limit."""
+        assert await self._recorded_limit(db, tenant_a, monkeypatch, "v1") == [10]
+
+    async def test_baseline_narrow_search_ignores_the_configured_limit(
+        self, db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Under baseline the narrow-scope search keeps 20 whatever is configured."""
+        assert await self._recorded_limit(db, tenant_a, monkeypatch, "baseline") == [20]

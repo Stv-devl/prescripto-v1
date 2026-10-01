@@ -55,6 +55,15 @@ class Settings(BaseSettings):
             "never overwritten by a v1 re-ingestion."
         ),
     )
+    v1_search_limit: int = Field(
+        default=15,
+        ge=1,
+        description=(
+            "Narrow-scope chat search limit under RETRIEVAL_MODE=v1; the per-query floor "
+            "scales with it (services/chat/search_limits.py). Baseline always uses 20. "
+            "15 kept on the pinned replays of 2026-10-01 (sprint/eval/result/v1-pin-delta.md)."
+        ),
+    )
 
     mistral_api_key: str
     pixtral_large_model: str = "pixtral-large-latest"

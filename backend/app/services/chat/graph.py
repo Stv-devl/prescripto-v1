@@ -56,6 +56,7 @@ from app.services.chat.prompts import (
 )
 from app.services.chat.query_rewrite import rewrite_query
 from app.services.chat.schema_extraction import enrich_schema_with_search, extract_schema
+from app.services.chat.search_limits import narrow_search_limit, query_limits
 from app.services.chat.table_extraction import extract_table
 
 configure_langsmith(settings)
@@ -163,7 +164,9 @@ async def _run_search(
 
     forced_queries = get_forced_related(search_query)
 
-    main_limit = max(search_limit, len(main_queries) * 5)
+    main_limit, forced_limit = query_limits(
+        search_limit, main_queries=len(main_queries), forced_queries=len(forced_queries)
+    )
     search_results = await search_service.search_merged(
         tenant_id=tenant_id,
         project_id=project_id,
@@ -178,7 +181,7 @@ async def _run_search(
             project_id=project_id,
             queries=forced_queries,
             filters=SearchFilters(),
-            limit=max(search_limit, len(forced_queries) * 5),
+            limit=forced_limit,
             score_threshold=0.30,
         )
         main_texts = {sr.text[:200] for sr in search_results}
@@ -443,7 +446,7 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
             structured = "none"
             schema_flag = "none"
         else:
-            search_limit = 20
+            search_limit = narrow_search_limit(settings.retrieval_mode, settings.v1_search_limit)
             context_max = CONTEXT_MAX_CHARS
             score_threshold = 0.40
             max_sources = MAX_DISPLAYED_SOURCES
