@@ -34,6 +34,7 @@ from app.services.chat.prompts import REWRITE_PROMPT
 from app.services.chat.sufficiency import JUDGE_PROMPT, REFORMULATE_PROMPT
 from app.services.sparse import query_sparse_vector
 from tests.fakes import FakePoint, FakeQdrant, FakeQueryResponse
+from tests.services.chat.question_log_capture import parsed, question_records
 from tests.services.chat.test_graph import (
     _chunk_point,
     _kind,
@@ -1093,3 +1094,108 @@ async def test_v1_generation_messages_start_with_the_system_prompt(
     assert isinstance(messages, list)
     assert messages[0]["role"] == "system"
     assert [m["role"] for m in messages].count("system") == 1
+
+
+async def test_v1_record_cost_equals_the_streamed_usage_event_total_with_a_non_zero_agent_leg(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-large-latest")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+    rewrite = _rewrite_response(query=BROAD_QUESTION)
+    rewrite.usage = UsageInfo(prompt_tokens=1_000_000, completion_tokens=0, total_tokens=1_000_000)
+    judge = _judge_reply("insuffisant")
+    judge.usage = UsageInfo(
+        prompt_tokens=2_000_000, completion_tokens=1_000_000, total_tokens=3_000_000
+    )
+    reformulation = _reformulation_reply(REFORMULATED)
+    reformulation.usage = UsageInfo(
+        prompt_tokens=1_000_000, completion_tokens=1_000_000, total_tokens=2_000_000
+    )
+    generation = UsageInfo(prompt_tokens=2_000_000, completion_tokens=0, total_tokens=2_000_000)
+
+    with (
+        question_records() as records,
+        _patched_qdrant(fake),
+        _patched_mistral(
+            rewrite_response=rewrite,
+            judge_response=judge,
+            reformulation_response=reformulation,
+            generation_usage=generation,
+        ),
+    ):
+        events = await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=BROAD_QUESTION,
+        )
+
+    assert len(records) == 1
+    record = parsed(records)[0]
+    usage = _usage_of(events)
+    legs = record["legs"]
+    assert isinstance(legs, dict)
+    assert legs["agent"]["cost_usd"] > 0
+    assert legs["agent"]["cost_usd"] == pytest.approx(usage["agent"]["cost_usd"])
+    assert legs["agent"]["cost_usd"] == pytest.approx(1.65)
+    assert record["cost_usd"] == pytest.approx(usage["total"]["cost_usd"])
+    assert record["cost_usd"] == pytest.approx(3.15)
+    assert record["input_tokens"] == 6_000_000
+    assert record["output_tokens"] == 2_000_000
+
+
+async def test_v1_broad_question_record_has_mode_v1_scope_broad_and_judged_true(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+
+    with (
+        question_records() as records,
+        _patched_qdrant(fake),
+        _patched_mistral(rewrite_response=_rewrite_response(query=BROAD_QUESTION)),
+    ):
+        await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=BROAD_QUESTION,
+        )
+
+    assert len(records) == 1
+    record = parsed(records)[0]
+    assert record["mode"] == "v1"
+    assert record["scope"] == "broad"
+    assert record["judged"] is True
+
+
+async def test_v1_narrow_question_record_has_judged_false(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+
+    with (
+        question_records() as records,
+        _patched_qdrant(fake),
+        _patched_mistral(rewrite_response=_rewrite_response(query=NARROW_QUESTION)),
+    ):
+        await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=NARROW_QUESTION,
+        )
+
+    assert len(records) == 1
+    record = parsed(records)[0]
+    assert record["mode"] == "v1"
+    assert record["judged"] is False

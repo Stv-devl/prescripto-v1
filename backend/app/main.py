@@ -11,9 +11,11 @@ from app.api.router import router
 from app.core.config import DEV_SEED_EMAIL, email_delivery_warning, settings
 from app.core.database import engine
 from app.core.exceptions import register_exception_handlers
+from app.core.log_config import configure_question_logger
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("app").setLevel(logging.DEBUG if settings.dev_mode else logging.INFO)
+configure_question_logger()
 
 
 async def _seed_dev_data() -> None:
