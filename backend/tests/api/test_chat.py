@@ -68,7 +68,7 @@ def _rewrite_response() -> SimpleNamespace:
 
 
 class TestChatEndpointSseContract:
-    async def test_happy_path_streams_conversation_id_text_sources_usage_done(
+    async def test_happy_path_streams_conversation_id_text_sources_done_without_usage(
         self, client: AsyncClient, db: AsyncSession, tenant_a: Tenant
     ) -> None:
         project = await project_service.create_project(
@@ -140,10 +140,10 @@ class TestChatEndpointSseContract:
             events.append("DONE" if payload == "[DONE]" else json.loads(payload))
 
         kinds = ["DONE" if e == "DONE" else next(iter(e)) for e in events]
-        assert kinds == ["conversation_id", "text", "text", "sources", "usage", "DONE"]
+        assert kinds == ["conversation_id", "text", "text", "sources", "DONE"]
         assert events[1]["text"] + events[2]["text"] == "Les fondations sont en béton armé."
         assert events[3]["sources"][0]["filename"] == "CCTP_fondations.pdf"
-        assert set(events[4]["usage"].keys()) == {"rewrite", "generation", "total"}
+        assert not any('"usage"' in line for line in lines)
 
     async def test_search_failure_streams_error_then_done(
         self, client: AsyncClient, db: AsyncSession, tenant_a: Tenant

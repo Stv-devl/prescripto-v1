@@ -424,3 +424,44 @@ async def test_rewrite_in_v1_waits_on_the_fast_limiter_not_the_large_one(
     )
     await rewrite_query(PLAIN_QUESTION, [])
     assert (fast_wait.await_count, large_wait.await_count) == (1, 0)
+
+
+async def test_v1_rewrite_sends_the_rewrite_cache_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _fake_mistral(NORMAL_JSON)
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.services.chat.query_rewrite.mistral_client", fake)
+    await rewrite_query(PLAIN_QUESTION, [])
+    assert fake.chat.complete_async.call_args.kwargs["prompt_cache_key"] == "prescripto-v1-rewrite"
+
+
+async def test_baseline_rewrite_sends_no_cache_key_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _fake_mistral(NORMAL_JSON)
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+    monkeypatch.setattr("app.services.chat.query_rewrite.mistral_client", fake)
+    await rewrite_query(PLAIN_QUESTION, [])
+    assert "prompt_cache_key" not in fake.chat.complete_async.call_args.kwargs
+
+
+async def test_v1_rewrite_messages_start_with_the_rewrite_prompt_as_system(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.chat.prompts import REWRITE_PROMPT
+
+    fake = _fake_mistral(NORMAL_JSON)
+    history = [
+        SimpleNamespace(role="user", content="Quels sont les lots ?"),
+        SimpleNamespace(role="assistant", content="Gros oeuvre et couverture."),
+    ]
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.services.chat.query_rewrite.mistral_client", fake)
+    await rewrite_query(PLAIN_QUESTION, history)
+    messages = fake.chat.complete_async.call_args.kwargs["messages"]
+    assert messages[0] == {"role": "system", "content": REWRITE_PROMPT}
+    assert messages[1:3] == [
+        {"role": "user", "content": "Quels sont les lots ?"},
+        {"role": "assistant", "content": "Gros oeuvre et couverture."},
+    ]

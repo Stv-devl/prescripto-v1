@@ -7,7 +7,7 @@ re-checked automatically, re-verify there before trusting either.
 import asyncio
 import time
 
-from mistralai import Mistral
+from mistralai.client import Mistral
 
 from app.core.config import settings
 

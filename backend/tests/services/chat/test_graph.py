@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from mistralai.models import UsageInfo
+from mistralai.client.models import UsageInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -323,7 +323,12 @@ async def test_happy_path_commits_assistant_message_with_content_and_sources(
 async def test_usage_leg_of_none_is_all_zeros() -> None:
     from app.services.chat.graph import _usage_leg
 
-    assert _usage_leg(None) == {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    assert _usage_leg(None) == {
+        "input_tokens": 0,
+        "cached_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+    }
 
 
 async def test_usage_leg_of_one_million_input_half_million_output_costs_1_25_usd() -> None:
@@ -331,7 +336,12 @@ async def test_usage_leg_of_one_million_input_half_million_output_costs_1_25_usd
 
     usage = UsageInfo(prompt_tokens=1_000_000, completion_tokens=500_000, total_tokens=1_500_000)
 
-    assert _usage_leg(usage) == {"input_tokens": 1_000_000, "output_tokens": 500_000, "cost_usd": 1.25}
+    assert _usage_leg(usage) == {
+        "input_tokens": 1_000_000,
+        "cached_tokens": 0,
+        "output_tokens": 500_000,
+        "cost_usd": 1.25,
+    }
 
 
 async def test_usage_leg_with_missing_prompt_tokens_counts_zero_input() -> None:
@@ -339,13 +349,18 @@ async def test_usage_leg_with_missing_prompt_tokens_counts_zero_input() -> None:
 
     usage = UsageInfo(prompt_tokens=None, completion_tokens=2_000_000, total_tokens=2_000_000)
 
-    assert _usage_leg(usage) == {"input_tokens": 0, "output_tokens": 2_000_000, "cost_usd": 3.0}
+    assert _usage_leg(usage) == {
+        "input_tokens": 0,
+        "cached_tokens": 0,
+        "output_tokens": 2_000_000,
+        "cost_usd": 3.0,
+    }
 
 
 async def test_usage_event_of_two_nones_zeroes_rewrite_generation_and_total() -> None:
     from app.services.chat.graph import _usage_event
 
-    zero = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    zero = {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
     assert _usage_event(None, None) == {"rewrite": zero, "generation": zero, "total": zero}
 
 
@@ -357,8 +372,18 @@ async def test_usage_event_with_only_generation_leaves_rewrite_zero_and_total_eq
     generation = UsageInfo(prompt_tokens=200_000, completion_tokens=100_000, total_tokens=300_000)
     event = _usage_event(None, generation)
 
-    assert event["rewrite"] == {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
-    assert event["generation"] == {"input_tokens": 200_000, "output_tokens": 100_000, "cost_usd": 0.25}
+    assert event["rewrite"] == {
+        "input_tokens": 0,
+        "cached_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+    }
+    assert event["generation"] == {
+        "input_tokens": 200_000,
+        "cached_tokens": 0,
+        "output_tokens": 100_000,
+        "cost_usd": 0.25,
+    }
     assert event["total"] == event["generation"]
 
 
@@ -370,7 +395,12 @@ async def test_usage_event_with_both_legs_sums_into_total() -> None:
 
     event = _usage_event(rewrite, generation)
 
-    assert event["total"] == {"input_tokens": 1_200_000, "output_tokens": 600_000, "cost_usd": 1.5}
+    assert event["total"] == {
+        "input_tokens": 1_200_000,
+        "cached_tokens": 0,
+        "output_tokens": 600_000,
+        "cost_usd": 1.5,
+    }
 
 
 # ── Business rules ────────────────────────────────────────────────
@@ -1215,3 +1245,69 @@ class TestNarrowSearchLimit:
     ) -> None:
         """Under baseline the narrow-scope search keeps 20 whatever is configured."""
         assert await self._recorded_limit(db, tenant_a, monkeypatch, "baseline") == [20]
+
+
+async def test_usage_leg_reports_cached_tokens_and_bills_them_at_a_tenth() -> None:
+    import pytest
+    from mistralai.client.models import UsageInfo
+
+    from app.services.chat.graph import _usage_leg
+
+    usage = UsageInfo.model_validate(
+        {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "total_tokens": 1_000_000,
+            "prompt_tokens_details": {"cached_tokens": 600_000},
+        }
+    )
+
+    assert _usage_leg(usage) == {
+        "input_tokens": 1_000_000,
+        "cached_tokens": 600_000,
+        "output_tokens": 0,
+        "cost_usd": pytest.approx(0.23),
+    }
+
+
+async def test_usage_event_sums_cached_tokens_into_total() -> None:
+    from mistralai.client.models import UsageInfo
+
+    from app.services.chat.graph import _usage_event
+
+    rewrite = UsageInfo.model_validate(
+        {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "total_tokens": 1_000_000,
+            "prompt_tokens_details": {"cached_tokens": 300_000},
+        }
+    )
+    generation = UsageInfo.model_validate(
+        {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "total_tokens": 1_000_000,
+            "prompt_tokens_details": {"cached_tokens": 500_000},
+        }
+    )
+
+    event = _usage_event(rewrite, generation)
+
+    assert event["total"]["cached_tokens"] == 800_000
+
+
+async def test_usage_leg_without_cached_tokens_costs_exactly_as_before() -> None:
+    import pytest
+    from mistralai.client.models import UsageInfo
+
+    from app.services.chat.graph import _usage_leg
+
+    usage = UsageInfo(prompt_tokens=1_000_000, completion_tokens=500_000, total_tokens=1_500_000)
+
+    assert _usage_leg(usage) == {
+        "input_tokens": 1_000_000,
+        "cached_tokens": 0,
+        "output_tokens": 500_000,
+        "cost_usd": pytest.approx(1.25),
+    }

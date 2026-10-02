@@ -14,10 +14,11 @@ dependencies = [
     # cluster provisioned 2026-09-18): the client warns when the major doesn't
     # match or the minor differs by more than 1.
     "qdrant-client>=1.19,<1.21",
-    # Upper bound is load-bearing: 2.x moved the client to `mistralai.client` and
-    # turned the root into a namespace package, so `from mistralai import Mistral`
-    # raises ImportError and the whole app stops importing. Last 1.x is 1.12.x.
-    "mistralai>=1.0,<2",
+    # 2.10.1 is the floor because it carries `prompt_cache_key` on chat
+    # complete/stream (j3-prompt-caching); every import goes through
+    # `mistralai.client`. Upper bound is load-bearing: 3.0.0 moved the transport
+    # from httpx to httpx2.
+    "mistralai>=2.10.1,<3",
     "bcrypt>=4.0",
     "python-jose[cryptography]>=3.3",
     "python-multipart>=0.0.18",

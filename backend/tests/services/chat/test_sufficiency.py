@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from mistralai.models import UsageInfo
+from mistralai.client.models import UsageInfo
 
 from app.schemas.search import SearchResult
 from app.services.chat.sufficiency import (
@@ -434,3 +434,39 @@ async def test_judge_in_baseline_waits_on_the_large_limiter_not_the_fast_one(
     _install_mistral(monkeypatch, '{"verdict": "suffisant"}', _usage())
     await judge_sufficiency("Quelle epaisseur ?", "[cctp.pdf, p.1]\ntexte", usage_sink=[])
     assert (fast_wait.await_count, large_wait.await_count) == (0, 1)
+
+
+async def test_v1_judge_sends_the_judge_cache_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "retrieval_mode", "v1")
+    complete = _install_mistral(monkeypatch, '{"verdict": "suffisant"}', _usage())
+    await judge_sufficiency("Quelle epaisseur ?", "[cctp.pdf, p.1]\ntexte", usage_sink=[])
+    assert complete.call_args.kwargs["prompt_cache_key"] == "prescripto-v1-judge"
+
+
+async def test_v1_reformulation_sends_the_reformulate_cache_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "retrieval_mode", "v1")
+    complete = _install_mistral(monkeypatch, '{"query": "epaisseur dalle"}', _usage())
+    await reformulate("Quelle epaisseur ?", "les cotes", first_query="epaisseur", usage_sink=[])
+    assert complete.call_args.kwargs["prompt_cache_key"] == "prescripto-v1-reformulate"
+
+
+async def test_baseline_judge_and_reformulation_send_no_cache_key_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "retrieval_mode", "baseline")
+    judge_complete = _install_mistral(monkeypatch, '{"verdict": "suffisant"}', _usage())
+    await judge_sufficiency("Quelle epaisseur ?", "[cctp.pdf, p.1]\ntexte", usage_sink=[])
+    reformulate_complete = _install_mistral(monkeypatch, '{"query": "epaisseur dalle"}', _usage())
+    await reformulate("Quelle epaisseur ?", "les cotes", first_query="epaisseur", usage_sink=[])
+    assert "prompt_cache_key" not in judge_complete.call_args.kwargs
+    assert "prompt_cache_key" not in reformulate_complete.call_args.kwargs

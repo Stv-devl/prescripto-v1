@@ -20,7 +20,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langsmith import traceable
-from mistralai.models import UsageInfo
+from mistralai.client.models import UsageInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,7 +41,14 @@ from app.services.chat.chunk_enrichment import enrich_with_dpgf_quantities, expa
 from app.services.chat.context_budget import render_context_parts, select_by_score
 from app.services.chat.context_dedup import render_merged_context
 from app.services.chat.context_enrichment import build_db_context
-from app.services.chat.model_routing import Price, price_for, short_call_model
+from app.services.chat.model_routing import (
+    Price,
+    cached_tokens_of,
+    input_cost_usd,
+    price_for,
+    prompt_cache_key,
+    short_call_model,
+)
 from app.services.chat.prompts import (
     CONTEXT_MAX_CHARS,
     FORCED_SCHEMA_RE,
@@ -85,16 +92,29 @@ _NUMBERS_RE = re.compile(r"[\d.,]+\s*(?:m[²³23]?|ml|kg|l)\b")
 def _usage_leg(
     usage: UsageInfo | None, price: Price = MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
 ) -> dict[str, int | float]:
-    """Token counts and USD cost for one Mistral call at `price`, zeroed if none was made."""
+    """Token counts and USD cost for one Mistral call at `price`, zeroed if none was made.
+
+    `input_tokens` includes the prompt-cache hits counted in `cached_tokens`, which are
+    billed at the reduced cached-input price."""
     input_tokens = usage.prompt_tokens or 0 if usage else 0
+    cached_tokens = cached_tokens_of(usage)
     output_tokens = usage.completion_tokens or 0 if usage else 0
-    cost_usd = (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
-    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd}
+    cost_usd = (
+        input_cost_usd(input_tokens, cached_tokens, price)
+        + output_tokens * price["output"] / 1_000_000
+    )
+    return {
+        "input_tokens": input_tokens,
+        "cached_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost_usd,
+    }
 
 
 def _sum_legs(legs: list[dict[str, int | float]]) -> dict[str, int | float]:
     return {
         "input_tokens": sum(leg["input_tokens"] for leg in legs),
+        "cached_tokens": sum(leg["cached_tokens"] for leg in legs),
         "output_tokens": sum(leg["output_tokens"] for leg in legs),
         "cost_usd": sum(leg["cost_usd"] for leg in legs),
     }
@@ -569,11 +589,14 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
         full_response = ""
         generation_usage: UsageInfo | None = None
 
+        cache_key = prompt_cache_key(settings.retrieval_mode, "generation")
+        cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
         await mistral_large_limiter.wait()
         stream = await mistral_client.chat.stream_async(
             model="mistral-large-latest",
             messages=state["mistral_messages"],
             temperature=0.1,
+            **cache_kwargs,
         )
         async for event in stream:
             token = event.data.choices[0].delta.content

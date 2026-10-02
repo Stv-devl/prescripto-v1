@@ -1,6 +1,7 @@
 """Chat API endpoints — SSE streaming and conversation management."""
 
 import uuid
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
@@ -10,6 +11,19 @@ from app.schemas.chat import ChatRequest, ConversationList, ConversationRead, Me
 from app.services import chat as chat_service
 
 router = APIRouter(tags=["chat"])
+
+_USAGE_EVENT_PREFIX = 'data: {"usage"'
+
+
+async def _without_usage_event(stream: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Drop the token/cost usage event from the client stream.
+
+    Usage stays an in-process measurement (the eval harness calls `chat_stream` directly):
+    its per-leg `cached_tokens` would let one tenant probe whether another one recently sent
+    the same text under the shared prompt-cache keys (j3-prompt-caching review)."""
+    async for event in stream:
+        if not event.startswith(_USAGE_EVENT_PREFIX):
+            yield event
 
 
 @router.post("/projects/{project_id}/chat")
@@ -29,7 +43,7 @@ async def chat(
         conversation_id=body.conversation_id,
     )
     return StreamingResponse(
-        stream,
+        _without_usage_event(stream),
         media_type="text/event-stream",
         headers={"X-Accel-Buffering": "no"},
     )

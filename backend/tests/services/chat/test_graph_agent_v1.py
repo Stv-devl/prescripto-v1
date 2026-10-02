@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from mistralai.models import UsageInfo
+from mistralai.client.models import UsageInfo
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.mistral import mistral_client, mistral_fast_limiter, mistral_large_limiter
@@ -468,11 +468,13 @@ async def test_v1_broad_usage_counts_judge_and_reformulation_in_agent_and_total(
     usage = _usage_of(events)
     assert usage["agent"] == {
         "input_tokens": 3_000_000,
+        "cached_tokens": 0,
         "output_tokens": 2_000_000,
         "cost_usd": pytest.approx(1.65),
     }
     assert usage["total"] == {
         "input_tokens": 6_000_000,
+        "cached_tokens": 0,
         "output_tokens": 2_000_000,
         "cost_usd": pytest.approx(3.15),
     }
@@ -489,10 +491,30 @@ async def test_usage_event_with_an_agent_list_adds_the_agent_leg_and_sums_it_int
     event = _usage_event(rewrite, generation, agent=[judge, reformulation])
 
     assert event == {
-        "rewrite": {"input_tokens": 1_000_000, "output_tokens": 0, "cost_usd": 0.5},
-        "generation": {"input_tokens": 2_000_000, "output_tokens": 0, "cost_usd": 1.0},
-        "agent": {"input_tokens": 3_000_000, "output_tokens": 2_000_000, "cost_usd": 4.5},
-        "total": {"input_tokens": 6_000_000, "output_tokens": 2_000_000, "cost_usd": 6.0},
+        "rewrite": {
+            "input_tokens": 1_000_000,
+            "cached_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.5,
+        },
+        "generation": {
+            "input_tokens": 2_000_000,
+            "cached_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 1.0,
+        },
+        "agent": {
+            "input_tokens": 3_000_000,
+            "cached_tokens": 0,
+            "output_tokens": 2_000_000,
+            "cost_usd": 4.5,
+        },
+        "total": {
+            "input_tokens": 6_000_000,
+            "cached_tokens": 0,
+            "output_tokens": 2_000_000,
+            "cost_usd": 6.0,
+        },
     }
 
 
@@ -847,6 +869,7 @@ async def test_v1_rewrite_leg_is_priced_at_the_rewrite_models_price(
 
     assert _usage_of(events)["rewrite"] == {
         "input_tokens": 1_000_000,
+        "cached_tokens": 0,
         "output_tokens": 0,
         "cost_usd": pytest.approx(0.5),
     }
@@ -871,21 +894,25 @@ async def test_usage_event_with_a_short_call_price_prices_rewrite_and_agent_at_i
 
     assert event["rewrite"] == {
         "input_tokens": 1_000_000,
+        "cached_tokens": 0,
         "output_tokens": 0,
         "cost_usd": pytest.approx(0.15),
     }
     assert event["generation"] == {
         "input_tokens": 2_000_000,
+        "cached_tokens": 0,
         "output_tokens": 0,
         "cost_usd": pytest.approx(1.0),
     }
     assert event["agent"] == {
         "input_tokens": 3_000_000,
+        "cached_tokens": 0,
         "output_tokens": 2_000_000,
         "cost_usd": pytest.approx(1.65),
     }
     assert event["total"] == {
         "input_tokens": 6_000_000,
+        "cached_tokens": 0,
         "output_tokens": 2_000_000,
         "cost_usd": pytest.approx(2.8),
     }
@@ -940,3 +967,129 @@ async def test_v1_rewrite_leg_follows_a_non_large_rewrite_models_price(
         )
 
     assert _usage_of(events)["rewrite"]["cost_usd"] == pytest.approx(0.15)
+
+
+async def test_v1_broad_usage_reports_the_cached_tokens_of_each_leg(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-large-latest")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+
+    def _cached_usage(prompt_tokens: int, cached_tokens: int) -> UsageInfo:
+        return UsageInfo.model_validate(
+            {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 0,
+                "total_tokens": prompt_tokens,
+                "prompt_tokens_details": {"cached_tokens": cached_tokens},
+            }
+        )
+
+    rewrite = _rewrite_response(query=BROAD_QUESTION)
+    rewrite.usage = _cached_usage(1_000_000, 500_000)
+    judge = _judge_reply("insuffisant")
+    judge.usage = _cached_usage(1_000_000, 1_000_000)
+    reformulation = _reformulation_reply(REFORMULATED)
+    reformulation.usage = _cached_usage(1_000_000, 0)
+    generation = _cached_usage(2_000_000, 1_000_000)
+
+    with _patched_qdrant(fake), _patched_mistral(
+        rewrite_response=rewrite,
+        judge_response=judge,
+        reformulation_response=reformulation,
+        generation_usage=generation,
+    ):
+        events = await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=BROAD_QUESTION,
+        )
+
+    usage = _usage_of(events)
+    assert usage["rewrite"]["cached_tokens"] == 500_000
+    assert usage["rewrite"]["cost_usd"] == pytest.approx(0.275)
+    assert usage["generation"]["cached_tokens"] == 1_000_000
+    assert usage["generation"]["cost_usd"] == pytest.approx(0.55)
+    assert usage["agent"]["cached_tokens"] == 1_000_000
+    assert usage["agent"]["cost_usd"] == pytest.approx(0.165)
+    assert usage["total"]["cached_tokens"] == 2_500_000
+    assert usage["total"]["cost_usd"] == pytest.approx(0.99)
+
+
+async def test_v1_stream_whose_last_chunk_has_no_cached_details_reports_zero_cached_tokens(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+    generation = UsageInfo(prompt_tokens=2_000_000, completion_tokens=0, total_tokens=2_000_000)
+
+    with _patched_qdrant(fake), _patched_mistral(
+        rewrite_response=_rewrite_response(query=BROAD_QUESTION),
+        generation_usage=generation,
+    ):
+        events = await _stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=BROAD_QUESTION,
+        )
+
+    assert _usage_of(events)["generation"]["cached_tokens"] == 0
+
+
+# ── Prompt caching: the generation call ───────────────────────────
+
+
+async def _generation_kwargs(
+    db: AsyncSession, tenant: Tenant, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> dict[str, object]:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", mode)
+    project, user = await _project_and_user(db, tenant)
+    fake = FakeQdrant(_points(tenant.id, project.id))
+
+    with _patched_qdrant(fake), _patched_mistral(
+        rewrite_response=_rewrite_response(query=NARROW_QUESTION)
+    ) as stream_mock:
+        await _stream(
+            db,
+            tenant_id=tenant.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=NARROW_QUESTION,
+        )
+
+    return dict(stream_mock.call_args.kwargs)
+
+
+async def test_v1_generation_sends_the_generation_cache_key(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kwargs = await _generation_kwargs(db, tenant_a, monkeypatch, "v1")
+
+    assert kwargs["prompt_cache_key"] == "prescripto-v1-generation"
+
+
+async def test_baseline_generation_sends_no_cache_key_argument(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kwargs = await _generation_kwargs(db, tenant_a, monkeypatch, "baseline")
+
+    assert "prompt_cache_key" not in kwargs
+
+
+async def test_v1_generation_messages_start_with_the_system_prompt(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kwargs = await _generation_kwargs(db, tenant_a, monkeypatch, "v1")
+
+    messages = kwargs["messages"]
+    assert isinstance(messages, list)
+    assert messages[0]["role"] == "system"
+    assert [m["role"] for m in messages].count("system") == 1
