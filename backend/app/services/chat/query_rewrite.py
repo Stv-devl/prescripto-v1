@@ -94,13 +94,13 @@ async def rewrite_query(
                         "Rewrite guard: off-topic reply overridden for a normative question"
                     )
                     return question, [], "specific", "none", "none"
-                logger.debug(f"[SEARCH DEBUG] Off-topic detected: '{question}'")
+                logger.debug("[SEARCH DEBUG] Off-topic detected")
                 return None, [], "specific", "none", "none"
 
             query, related, scope, structured, schema = _parse_rewrite_response(cleaned)
             logger.debug(
-                f"[SEARCH DEBUG] Rewrite: '{question}' → '{query}' "
-                f"(related={related}, scope={scope}, structured={structured}, schema={schema})"
+                f"[SEARCH DEBUG] Rewrite: {len(question)} → {len(query or '')} chars "
+                f"(related={len(related)}, scope={scope}, structured={structured}, schema={schema})"
             )
             return query, related, scope, structured, schema
     except Exception:

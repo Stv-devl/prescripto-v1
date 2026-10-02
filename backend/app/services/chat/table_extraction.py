@@ -106,10 +106,7 @@ def _merge_duplicate_rows(
                 new_desc = row.get(desc_key, "")
                 if len(new_desc) > len(old_desc):
                     existing[desc_key] = new_desc
-            logger.debug(
-                f"[TABLE DEBUG] Merged duplicate row: '{elem_val}' "
-                f"→ qty='{existing.get(qty_key, '')}', loc='{existing.get(loc_key, '')}'"
-            )
+            logger.debug("[TABLE DEBUG] Merged duplicate row")
         else:
             seen[norm_elem] = len(merged)
             merged.append(dict(row))
@@ -131,9 +128,6 @@ async def extract_table(
             f"[TABLE DEBUG] Context sent to LLM: {len(truncated_context)} chars, "
             f"{len(context_lines)} lines (truncated={len(reordered) > TABLE_CONTEXT_LIMIT})"
         )
-        for i, line in enumerate(context_lines):
-            if line.startswith("[") and ", p." in line:
-                logger.debug(f"[TABLE DEBUG]   chunk {i}: {line[:120]}")
 
         await mistral_large_limiter.wait()
         response = await mistral_client.chat.complete_async(
@@ -152,7 +146,7 @@ async def extract_table(
             response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content  # type: ignore[union-attr]
-        logger.debug(f"[TABLE DEBUG] Raw LLM response: {raw[:500] if raw else 'None'}")
+        logger.debug(f"[TABLE DEBUG] Raw LLM response: {len(raw) if raw else 0} chars")
         if not raw:
             return None
 
@@ -186,10 +180,7 @@ async def extract_table(
             if isinstance(r, dict):
                 row = {k: str(v) for k, v in r.items()}
                 if qty_key and no_qty_re.match(row.get(qty_key, "").strip()):
-                    element = row.get("element", row.get(list(row.keys())[0], "?"))
-                    logger.debug(
-                        f"[TABLE DEBUG] Row filtered (no qty): '{element}' — qty='{row.get(qty_key, '')}'"
-                    )
+                    logger.debug("[TABLE DEBUG] Row filtered (no qty)")
                     continue
                 rows.append(row)
 
@@ -210,7 +201,7 @@ async def extract_table(
 
         table = StructuredTable(title=data.get("title", ""), columns=columns, rows=rows)
         logger.debug(
-            f"[CHAT DEBUG] Extracted table: {table.title} ({len(table.rows)} rows, {filled}/{total_cells} filled)"
+            f"[CHAT DEBUG] Extracted table: {len(table.rows)} rows, {filled}/{total_cells} filled"
         )
         return table
     except Exception:

@@ -218,7 +218,7 @@ async def search_documents(
     hits = _dedup_by_latest_version(hits)
 
     logger.debug(
-        f"[SEARCH DEBUG] query='{query}' | hits={len(hits)} | "
+        f"[SEARCH DEBUG] query_chars={len(query)} | hits={len(hits)} | "
         f"scores={[round(h.score, 3) for h in hits]}"
     )
 
@@ -291,7 +291,7 @@ async def search_diverse(
     hits = _dedup_by_latest_version(hits)
 
     logger.debug(
-        f"[SEARCH DEBUG diverse] query='{query}' | pool={len(hits)} | "
+        f"[SEARCH DEBUG diverse] query_chars={len(query)} | pool={len(hits)} | "
         f"top_scores={[round(h.score, 3) for h in hits[:5]]}"
     )
 
@@ -584,7 +584,7 @@ async def search_merged(
                 query_best[i] = (point_id, hit.score, hit)
 
         logger.debug(
-            f"[SEARCH DEBUG merged] query[{i}]='{queries[i][:80]}' | "
+            f"[SEARCH DEBUG merged] query[{i}] | "
             f"hits={len(hits)} | scores={[round(h.score, 3) for h in hits]}"
         )
 
