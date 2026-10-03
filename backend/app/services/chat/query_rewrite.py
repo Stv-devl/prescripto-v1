@@ -6,11 +6,11 @@ import re
 from itertools import pairwise
 from typing import Protocol
 
-from mistralai.models import UsageInfo
+from mistralai.client.models import UsageInfo
 
 from app.core.config import settings
 from app.core.mistral import mistral_client, mistral_fast_limiter, mistral_large_limiter
-from app.services.chat.model_routing import is_large, short_call_model
+from app.services.chat.model_routing import is_large, prompt_cache_key, short_call_model
 from app.services.chat.prompts import OFF_TOPIC, REWRITE_PROMPT
 from app.services.sparse import tokenize
 
@@ -73,12 +73,15 @@ async def rewrite_query(
     try:
         model = short_call_model(settings.retrieval_mode, settings.v1_rewrite_model)
         limiter = mistral_large_limiter if is_large(model) else mistral_fast_limiter
+        cache_key = prompt_cache_key(settings.retrieval_mode, "rewrite")
+        cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
         await limiter.wait()
         response = await mistral_client.chat.complete_async(
             model=model,
             messages=messages,
             temperature=0.0,
             max_tokens=300,
+            **cache_kwargs,
         )
         if usage_sink is not None:
             usage_sink.append(response.usage)
@@ -91,13 +94,13 @@ async def rewrite_query(
                         "Rewrite guard: off-topic reply overridden for a normative question"
                     )
                     return question, [], "specific", "none", "none"
-                logger.debug(f"[SEARCH DEBUG] Off-topic detected: '{question}'")
+                logger.debug("[SEARCH DEBUG] Off-topic detected")
                 return None, [], "specific", "none", "none"
 
             query, related, scope, structured, schema = _parse_rewrite_response(cleaned)
             logger.debug(
-                f"[SEARCH DEBUG] Rewrite: '{question}' → '{query}' "
-                f"(related={related}, scope={scope}, structured={structured}, schema={schema})"
+                f"[SEARCH DEBUG] Rewrite: {len(question)} → {len(query or '')} chars "
+                f"(related={len(related)}, scope={scope}, structured={structured}, schema={schema})"
             )
             return query, related, scope, structured, schema
     except Exception:

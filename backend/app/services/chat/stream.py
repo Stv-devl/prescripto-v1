@@ -7,7 +7,7 @@ import re
 import uuid
 from collections.abc import AsyncGenerator
 
-from mistralai.models import UsageInfo
+from mistralai.client.models import UsageInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 

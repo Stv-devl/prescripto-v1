@@ -81,11 +81,13 @@ class Settings(BaseSettings):
         ),
     )
     v1_fast_rps: float = Field(
-        default=1.0,
+        default=1.5,
         gt=0,
         description=(
-            "Requests per second allowed on the fast model's own rate limiter. Prudent "
-            "default: the workspace quota of mistral-small was not read when this was set."
+            "Requests per second allowed on the fast model's own rate limiter. The workspace "
+            "quota of mistral-small-2603 is 1.67 req/s and 100k tokens/min "
+            "(docs/research-cache/settled.md, 2026-10-02); 1.5 keeps a 10% margin. The limiter "
+            "is per process: several backend tasks share the quota and must split this value."
         ),
     )
 

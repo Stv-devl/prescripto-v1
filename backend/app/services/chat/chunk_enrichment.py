@@ -360,10 +360,7 @@ async def enrich_with_dpgf_quantities(
     added = len(enriched) - len(search_results)
     if added:
         for sr in enriched[len(search_results) :]:
-            logger.debug(
-                f"[CHAT DEBUG]   DPGF kept: p.{sr.page} "
-                f"text='{sr.text[:150].replace(chr(10), ' ')}...'"
-            )
+            logger.debug(f"[CHAT DEBUG]   DPGF kept: p.{sr.page} ({len(sr.text)} chars)")
     else:
         logger.debug("[CHAT DEBUG] DPGF enrichment: no new chunks after filtering")
 

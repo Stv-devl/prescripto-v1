@@ -59,7 +59,7 @@ def _strip_non_precise(params: dict[str, str]) -> dict[str, str]:
             except (json.JSONDecodeError, TypeError):
                 cleaned[key] = value
         elif _NON_PRECISE_RE.match(value.strip()):
-            logger.debug(f"[SCHEMA DEBUG] Stripped param '{key}' = '{value}' (non précisé)")
+            logger.debug(f"[SCHEMA DEBUG] Stripped param '{key}' (non précisé)")
         else:
             cleaned[key] = value
     return cleaned
@@ -93,13 +93,11 @@ async def extract_schema(
             return None
 
         data = json.loads(raw.strip())
-        logger.debug(f"[SCHEMA DEBUG] Raw LLM response: {raw.strip()[:500]}")
+        logger.debug(f"[SCHEMA DEBUG] Raw LLM response: {len(raw)} chars")
         schema_type = data.get("schema_type", "none").strip().lower()
 
         if schema_type == "none" or schema_type not in SCHEMA_TYPES:
-            logger.debug(
-                f"[SCHEMA DEBUG] Rejected: type='{schema_type}' not in {list(SCHEMA_TYPES.keys())}"
-            )
+            logger.debug(f"[SCHEMA DEBUG] Rejected: type not in {list(SCHEMA_TYPES.keys())}")
             return None
 
         params: dict[str, str] = {}
@@ -121,7 +119,8 @@ async def extract_schema(
 
         if not params:
             logger.debug(
-                f"[SCHEMA DEBUG] Rejected (no params): type='{schema_type}', raw_params={raw_params}"
+                f"[SCHEMA DEBUG] Rejected (no params): type='{schema_type}', "
+                f"raw_params={len(raw_params)}"
             )
             return None
 
@@ -135,7 +134,7 @@ async def extract_schema(
         )
         return schema
     except Exception as exc:
-        logger.debug(f"[SCHEMA DEBUG] EXCEPTION: {exc}")
+        logger.debug(f"[SCHEMA DEBUG] EXCEPTION: {type(exc).__name__}")
         logger.exception("Schema extraction failed")
         return None
 
@@ -159,22 +158,20 @@ def _enrich_schema_from_context(
         if re.search(r"fouille|fond|cote|profondeur", line, re.IGNORECASE)
     ]
     logger.debug(f"[CHAT DEBUG] Fond de fouille context scan: {len(fouille_lines)} lines found")
-    for fl in fouille_lines[:5]:
-        logger.debug(f"  → {fl}")
 
     if "gros_beton" not in params:
         m = _GROS_BETON_RE.search(context)
         if m:
             value = m.group(1).strip()
             params["gros_beton"] = value
-            logger.debug(f"[CHAT DEBUG] Enriched gros_beton from context: '{value}'")
+            logger.debug("[CHAT DEBUG] Enriched gros_beton from context")
 
     if "bon_sol" not in params:
         m = _BON_SOL_RE.search(context)
         if m:
             value = m.group(1).strip().rstrip(".,;:")
             params["bon_sol"] = value
-            logger.debug(f"[CHAT DEBUG] Enriched bon_sol from context: '{value}'")
+            logger.debug("[CHAT DEBUG] Enriched bon_sol from context")
 
     return params
 
@@ -222,8 +219,7 @@ async def enrich_schema_with_search(
         for line in targeted_text.split("\n")
         if re.search(r"cote|niveau|profondeur|fouille|rigole|\d+[.,]\d+\s*m", line, re.IGNORECASE)
     ]
-    for fl in fouille_lines[:8]:
-        logger.debug(f"  → {fl}")
+    logger.debug(f"[CHAT DEBUG] Targeted fouille scan: {len(fouille_lines)} lines found")
 
     params = dict(schema.params)
 
@@ -232,14 +228,14 @@ async def enrich_schema_with_search(
         if m:
             value = m.group(1).strip()
             params["gros_beton"] = value
-            logger.debug(f"[CHAT DEBUG] Enriched gros_beton: '{value}'")
+            logger.debug("[CHAT DEBUG] Enriched gros_beton")
 
     if "bon_sol" not in params:
         m = _BON_SOL_RE.search(targeted_text)
         if m:
             value = m.group(1).strip().rstrip(".,;:")
             params["bon_sol"] = value
-            logger.debug(f"[CHAT DEBUG] Enriched bon_sol: '{value}'")
+            logger.debug("[CHAT DEBUG] Enriched bon_sol")
 
     return StructuredSchema(
         schema_type=schema.schema_type,

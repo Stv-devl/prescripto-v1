@@ -7,12 +7,17 @@ import re
 import uuid
 from dataclasses import dataclass
 
-from mistralai.models import UsageInfo
+from mistralai.client.models import UsageInfo
 
 from app.core.config import settings
 from app.core.mistral import mistral_client, mistral_fast_limiter, mistral_large_limiter
 from app.schemas.search import SearchResult
-from app.services.chat.model_routing import is_large, short_call_model
+from app.services.chat.model_routing import (
+    PromptName,
+    is_large,
+    prompt_cache_key,
+    short_call_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,15 +143,20 @@ def parse_reformulation(raw: str | None, *, first_query: str) -> str | None:
     return reformulated
 
 
-async def _complete(system: str, user: str, usage_sink: list[UsageInfo]) -> str | None:
+async def _complete(
+    system: str, user: str, usage_sink: list[UsageInfo], prompt: PromptName
+) -> str | None:
     model = short_call_model(settings.retrieval_mode, settings.v1_fast_model)
     limiter = mistral_large_limiter if is_large(model) else mistral_fast_limiter
+    cache_key = prompt_cache_key(settings.retrieval_mode, prompt)
+    cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
     await limiter.wait()
     response = await mistral_client.chat.complete_async(
         model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.0,
         max_tokens=150,
+        **cache_kwargs,
     )
     if response.usage is not None:
         usage_sink.append(response.usage)
@@ -162,7 +172,7 @@ async def judge_sufficiency(
         return Judgment(False, "")
     user = f"Question : {question}\n\nPassages (début de chacun) :\n\n{condense_passages(context_block)}"
     try:
-        raw = await _complete(JUDGE_PROMPT, user, usage_sink)
+        raw = await _complete(JUDGE_PROMPT, user, usage_sink, "judge")
     except Exception:
         logger.exception("Sufficiency judge failed, serving the first search")
         return _SUFFICIENT
@@ -179,7 +189,7 @@ async def reformulate(
         f"Première requête : {first_query}"
     )
     try:
-        raw = await _complete(REFORMULATE_PROMPT, user, usage_sink)
+        raw = await _complete(REFORMULATE_PROMPT, user, usage_sink, "reformulate")
     except Exception:
         logger.exception("Retry query reformulation failed, no retry")
         return None

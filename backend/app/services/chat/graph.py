@@ -11,8 +11,9 @@ are closures bound per request in _build_graph(), never state fields.
 import json
 import logging
 import re
+import time
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from types import SimpleNamespace
 from typing import TypedDict
 
@@ -20,12 +21,13 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langsmith import traceable
-from mistralai.models import UsageInfo
+from mistralai.client.models import UsageInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.langsmith import configure_langsmith
+from app.core.log_config import QUESTION_LOGGER
 from app.core.mistral import (
     MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS,
     mistral_client,
@@ -41,7 +43,14 @@ from app.services.chat.chunk_enrichment import enrich_with_dpgf_quantities, expa
 from app.services.chat.context_budget import render_context_parts, select_by_score
 from app.services.chat.context_dedup import render_merged_context
 from app.services.chat.context_enrichment import build_db_context
-from app.services.chat.model_routing import Price, price_for, short_call_model
+from app.services.chat.model_routing import (
+    Price,
+    cached_tokens_of,
+    input_cost_usd,
+    price_for,
+    prompt_cache_key,
+    short_call_model,
+)
 from app.services.chat.prompts import (
     CONTEXT_MAX_CHARS,
     FORCED_SCHEMA_RE,
@@ -56,6 +65,7 @@ from app.services.chat.prompts import (
     system_prompt_for,
 )
 from app.services.chat.query_rewrite import rewrite_query
+from app.services.chat.question_log import build_question_record
 from app.services.chat.schema_extraction import enrich_schema_with_search, extract_schema
 from app.services.chat.search_limits import narrow_search_limit, query_limits
 from app.services.chat.sufficiency import (
@@ -70,6 +80,7 @@ from app.services.chat.table_extraction import extract_table
 configure_langsmith(settings)
 
 logger = logging.getLogger(__name__)
+question_logger = logging.getLogger(QUESTION_LOGGER)
 
 SEARCH_ERROR_MESSAGE = (
     "Le service de recherche est temporairement indisponible. "
@@ -85,16 +96,29 @@ _NUMBERS_RE = re.compile(r"[\d.,]+\s*(?:m[²³23]?|ml|kg|l)\b")
 def _usage_leg(
     usage: UsageInfo | None, price: Price = MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
 ) -> dict[str, int | float]:
-    """Token counts and USD cost for one Mistral call at `price`, zeroed if none was made."""
+    """Token counts and USD cost for one Mistral call at `price`, zeroed if none was made.
+
+    `input_tokens` includes the prompt-cache hits counted in `cached_tokens`, which are
+    billed at the reduced cached-input price."""
     input_tokens = usage.prompt_tokens or 0 if usage else 0
+    cached_tokens = cached_tokens_of(usage)
     output_tokens = usage.completion_tokens or 0 if usage else 0
-    cost_usd = (input_tokens * price["input"] + output_tokens * price["output"]) / 1_000_000
-    return {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd}
+    cost_usd = (
+        input_cost_usd(input_tokens, cached_tokens, price)
+        + output_tokens * price["output"] / 1_000_000
+    )
+    return {
+        "input_tokens": input_tokens,
+        "cached_tokens": cached_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost_usd,
+    }
 
 
 def _sum_legs(legs: list[dict[str, int | float]]) -> dict[str, int | float]:
     return {
         "input_tokens": sum(leg["input_tokens"] for leg in legs),
+        "cached_tokens": sum(leg["cached_tokens"] for leg in legs),
         "output_tokens": sum(leg["output_tokens"] for leg in legs),
         "cost_usd": sum(leg["cost_usd"] for leg in legs),
     }
@@ -569,11 +593,14 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
         full_response = ""
         generation_usage: UsageInfo | None = None
 
+        cache_key = prompt_cache_key(settings.retrieval_mode, "generation")
+        cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
         await mistral_large_limiter.wait()
         stream = await mistral_client.chat.stream_async(
             model="mistral-large-latest",
             messages=state["mistral_messages"],
             temperature=0.1,
+            **cache_kwargs,
         )
         async for event in stream:
             token = event.data.choices[0].delta.content
@@ -740,6 +767,7 @@ async def chat_stream(
     conversation_id: uuid.UUID | None = None,
 ) -> AsyncGenerator[str, None]:
     """Stream a RAG chat response as SSE events — LangGraph-orchestrated (J1)."""
+    started = time.perf_counter()
     await project_service.get_project(db, tenant_id, project_id)
 
     if conversation_id:
@@ -775,51 +803,110 @@ async def chat_stream(
 
     final_payload: dict[str, object] | None = None
     error_message: str | None = None
+    ttft_ms: int | None = None
+    completed = False
 
-    async for chunk in graph.astream(initial_state, config, stream_mode="custom"):
-        if "__final__" in chunk:
-            final_payload = chunk["__final__"]
-            continue
-        if "error" in chunk:
-            error_message = str(chunk["error"])
-        yield f"data: {json.dumps(chunk)}\n\n"
+    try:
+        async for chunk in graph.astream(initial_state, config, stream_mode="custom"):
+            if "__final__" in chunk:
+                final_payload = chunk["__final__"]
+                continue
+            if "error" in chunk:
+                error_message = str(chunk["error"])
+            if ttft_ms is None and "text" in chunk:
+                ttft_ms = _elapsed_ms(started)
+            yield f"data: {json.dumps(chunk)}\n\n"
 
-    if error_message is not None:
+        if error_message is not None:
+            completed = True
+            yield "data: [DONE]\n\n"
+            return
+
+        assert final_payload is not None
+        sources: list[Source] = final_payload["sources"]  # type: ignore[assignment]
+        table: StructuredTable | None = final_payload["table"]  # type: ignore[assignment]
+        schema: StructuredSchema | None = final_payload["schema"]  # type: ignore[assignment]
+
+        sources_json = json.dumps([s.model_dump(mode="json") for s in sources])
+        structured_json_str = table.model_dump_json() if table else None
+        schema_json_str = schema.model_dump_json() if schema else None
+        assistant_msg = Message(
+            conversation_id=conv.id,
+            role="assistant",
+            content=final_payload["full_response"],
+            sources_json=sources_json,
+            structured_json=structured_json_str,
+            schema_json=schema_json_str,
+        )
+        db.add(assistant_msg)
+        await db.commit()
+
+        yield f"data: {json.dumps({'usage': _question_usage(final_payload)})}\n\n"
+        completed = True
         yield "data: [DONE]\n\n"
-        return
+    finally:
+        _log_question(
+            graph,
+            config,
+            tenant_id=tenant_id,
+            conversation_id=conv.id,
+            started=started,
+            ttft_ms=ttft_ms,
+            failed=not completed,
+        )
 
-    assert final_payload is not None
-    sources: list[Source] = final_payload["sources"]  # type: ignore[assignment]
-    table: StructuredTable | None = final_payload["table"]  # type: ignore[assignment]
-    schema: StructuredSchema | None = final_payload["schema"]  # type: ignore[assignment]
 
-    sources_json = json.dumps([s.model_dump(mode="json") for s in sources])
-    structured_json_str = table.model_dump_json() if table else None
-    schema_json_str = schema.model_dump_json() if schema else None
-    assistant_msg = Message(
-        conversation_id=conv.id,
-        role="assistant",
-        content=final_payload["full_response"],
-        sources_json=sources_json,
-        structured_json=structured_json_str,
-        schema_json=schema_json_str,
-    )
-    db.add(assistant_msg)
-    await db.commit()
+def _elapsed_ms(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
 
+
+def _question_usage(values: Mapping[str, object]) -> dict[str, object]:
+    """The {rewrite, generation, [agent,] total} usage of one question, priced per mode.
+
+    `values` is the `__final__` payload or the graph's final state: both carry the
+    `rewrite_usage` / `generation_usage` / `agent_usage` keys, possibly unset."""
     agent_usage: list[UsageInfo] | None = None
     short_call_price: Price | None = None
     rewrite_price: Price | None = None
     if settings.retrieval_mode == "v1":
-        agent_usage = final_payload["agent_usage"] or []  # type: ignore[assignment]
+        agent_usage = values.get("agent_usage") or []  # type: ignore[assignment]
         short_call_price = price_for(short_call_model("v1", settings.v1_fast_model))
         rewrite_price = price_for(short_call_model("v1", settings.v1_rewrite_model))
-    usage_event = _usage_event(
-        final_payload["rewrite_usage"],  # type: ignore[arg-type]
-        final_payload["generation_usage"],  # type: ignore[arg-type]
+    return _usage_event(
+        values.get("rewrite_usage"),  # type: ignore[arg-type]
+        values.get("generation_usage"),  # type: ignore[arg-type]
         agent_usage,
         short_call_price=short_call_price,
         rewrite_price=rewrite_price,
     )
-    yield f"data: {json.dumps({'usage': usage_event})}\n\n"
-    yield "data: [DONE]\n\n"
+
+
+def _log_question(
+    graph: object,
+    config: dict[str, dict[str, str]],
+    *,
+    tenant_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    started: float,
+    ttft_ms: int | None,
+    failed: bool,
+) -> None:
+    """Emit the one `chat_question` JSON record of this question; never raises.
+
+    Reads the final state synchronously (InMemorySaver) so it also runs from the `finally`
+    of a cancelled or closed stream."""
+    try:
+        state = graph.get_state(config).values  # type: ignore[attr-defined]
+        record = build_question_record(
+            state=state,
+            usage=_question_usage(state),  # type: ignore[arg-type]
+            mode=settings.retrieval_mode,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            latency_ms=_elapsed_ms(started),
+            ttft_ms=ttft_ms,
+            failed=failed,
+        )
+        question_logger.info(json.dumps(record))
+    except Exception:
+        logger.exception("Question log record failed")

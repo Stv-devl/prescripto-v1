@@ -29,7 +29,8 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from mistralai.models import UsageInfo
+from mistralai.client.models import UsageInfo
+from pytest import LogCaptureFixture
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -323,7 +324,12 @@ async def test_happy_path_commits_assistant_message_with_content_and_sources(
 async def test_usage_leg_of_none_is_all_zeros() -> None:
     from app.services.chat.graph import _usage_leg
 
-    assert _usage_leg(None) == {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    assert _usage_leg(None) == {
+        "input_tokens": 0,
+        "cached_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+    }
 
 
 async def test_usage_leg_of_one_million_input_half_million_output_costs_1_25_usd() -> None:
@@ -331,7 +337,12 @@ async def test_usage_leg_of_one_million_input_half_million_output_costs_1_25_usd
 
     usage = UsageInfo(prompt_tokens=1_000_000, completion_tokens=500_000, total_tokens=1_500_000)
 
-    assert _usage_leg(usage) == {"input_tokens": 1_000_000, "output_tokens": 500_000, "cost_usd": 1.25}
+    assert _usage_leg(usage) == {
+        "input_tokens": 1_000_000,
+        "cached_tokens": 0,
+        "output_tokens": 500_000,
+        "cost_usd": 1.25,
+    }
 
 
 async def test_usage_leg_with_missing_prompt_tokens_counts_zero_input() -> None:
@@ -339,13 +350,18 @@ async def test_usage_leg_with_missing_prompt_tokens_counts_zero_input() -> None:
 
     usage = UsageInfo(prompt_tokens=None, completion_tokens=2_000_000, total_tokens=2_000_000)
 
-    assert _usage_leg(usage) == {"input_tokens": 0, "output_tokens": 2_000_000, "cost_usd": 3.0}
+    assert _usage_leg(usage) == {
+        "input_tokens": 0,
+        "cached_tokens": 0,
+        "output_tokens": 2_000_000,
+        "cost_usd": 3.0,
+    }
 
 
 async def test_usage_event_of_two_nones_zeroes_rewrite_generation_and_total() -> None:
     from app.services.chat.graph import _usage_event
 
-    zero = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    zero = {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
     assert _usage_event(None, None) == {"rewrite": zero, "generation": zero, "total": zero}
 
 
@@ -357,8 +373,18 @@ async def test_usage_event_with_only_generation_leaves_rewrite_zero_and_total_eq
     generation = UsageInfo(prompt_tokens=200_000, completion_tokens=100_000, total_tokens=300_000)
     event = _usage_event(None, generation)
 
-    assert event["rewrite"] == {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
-    assert event["generation"] == {"input_tokens": 200_000, "output_tokens": 100_000, "cost_usd": 0.25}
+    assert event["rewrite"] == {
+        "input_tokens": 0,
+        "cached_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+    }
+    assert event["generation"] == {
+        "input_tokens": 200_000,
+        "cached_tokens": 0,
+        "output_tokens": 100_000,
+        "cost_usd": 0.25,
+    }
     assert event["total"] == event["generation"]
 
 
@@ -370,7 +396,12 @@ async def test_usage_event_with_both_legs_sums_into_total() -> None:
 
     event = _usage_event(rewrite, generation)
 
-    assert event["total"] == {"input_tokens": 1_200_000, "output_tokens": 600_000, "cost_usd": 1.5}
+    assert event["total"] == {
+        "input_tokens": 1_200_000,
+        "cached_tokens": 0,
+        "output_tokens": 600_000,
+        "cost_usd": 1.5,
+    }
 
 
 # ── Business rules ────────────────────────────────────────────────
@@ -1215,3 +1246,289 @@ class TestNarrowSearchLimit:
     ) -> None:
         """Under baseline the narrow-scope search keeps 20 whatever is configured."""
         assert await self._recorded_limit(db, tenant_a, monkeypatch, "baseline") == [20]
+
+
+async def test_usage_leg_reports_cached_tokens_and_bills_them_at_a_tenth() -> None:
+    import pytest
+    from mistralai.client.models import UsageInfo
+
+    from app.services.chat.graph import _usage_leg
+
+    usage = UsageInfo.model_validate(
+        {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "total_tokens": 1_000_000,
+            "prompt_tokens_details": {"cached_tokens": 600_000},
+        }
+    )
+
+    assert _usage_leg(usage) == {
+        "input_tokens": 1_000_000,
+        "cached_tokens": 600_000,
+        "output_tokens": 0,
+        "cost_usd": pytest.approx(0.23),
+    }
+
+
+async def test_usage_event_sums_cached_tokens_into_total() -> None:
+    from mistralai.client.models import UsageInfo
+
+    from app.services.chat.graph import _usage_event
+
+    rewrite = UsageInfo.model_validate(
+        {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "total_tokens": 1_000_000,
+            "prompt_tokens_details": {"cached_tokens": 300_000},
+        }
+    )
+    generation = UsageInfo.model_validate(
+        {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 0,
+            "total_tokens": 1_000_000,
+            "prompt_tokens_details": {"cached_tokens": 500_000},
+        }
+    )
+
+    event = _usage_event(rewrite, generation)
+
+    assert event["total"]["cached_tokens"] == 800_000
+
+
+async def test_usage_leg_without_cached_tokens_costs_exactly_as_before() -> None:
+    import pytest
+    from mistralai.client.models import UsageInfo
+
+    from app.services.chat.graph import _usage_leg
+
+    usage = UsageInfo(prompt_tokens=1_000_000, completion_tokens=500_000, total_tokens=1_500_000)
+
+    assert _usage_leg(usage) == {
+        "input_tokens": 1_000_000,
+        "cached_tokens": 0,
+        "output_tokens": 500_000,
+        "cost_usd": pytest.approx(1.25),
+    }
+
+
+async def test_happy_path_emits_exactly_one_chat_question_record(
+    db: AsyncSession, tenant_a: Tenant
+) -> None:
+    import logging
+
+    from tests.services.chat.question_log_capture import question_records
+
+    with question_records() as records:
+        events, _ = await _happy_path(db, tenant_a)
+
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    record = json.loads(records[0].getMessage())
+    assert isinstance(events[0], dict)
+    assert record["event"] == "chat_question"
+    assert record["tenant_id"] == str(tenant_a.id)
+    assert record["conversation_id"] == events[0]["conversation_id"]
+    assert record["mode"] == "baseline"
+    assert record["outcome"] == "answered"
+    assert record["judged"] is False
+    assert record["retried"] is False
+
+
+async def test_baseline_record_cost_equals_the_streamed_usage_event_total(
+    db: AsyncSession, tenant_a: Tenant
+) -> None:
+    import pytest
+
+    from tests.services.chat.question_log_capture import parsed, question_records, usage_event_of
+
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(
+        [_chunk_point(tenant_id=tenant_a.id, project_id=project.id, text=MAIN_CHUNK_TEXT)]
+    )
+    generation = UsageInfo(prompt_tokens=200_000, completion_tokens=100_000, total_tokens=300_000)
+
+    with (
+        question_records() as records,
+        _patched_qdrant(fake),
+        _patched_mistral(
+            rewrite_response=_rewrite_response(query=QUESTION), generation_usage=generation
+        ),
+    ):
+        events = await _stream(db, tenant_id=tenant_a.id, project_id=project.id, user_id=user.id)
+
+    assert len(records) == 1
+    record = parsed(records)[0]
+    total = usage_event_of(events)["total"]
+    assert total["cost_usd"] == pytest.approx(0.25)
+    assert record["cost_usd"] == pytest.approx(total["cost_usd"])
+    assert record["input_tokens"] == 200_000
+    assert record["output_tokens"] == 100_000
+    assert record["cached_tokens"] == 0
+    legs = record["legs"]
+    assert isinstance(legs, dict)
+    assert set(legs) == {"rewrite", "generation"}
+
+
+async def test_search_failure_still_emits_one_record_with_outcome_search_error_and_rewrite_cost(
+    db: AsyncSession, tenant_a: Tenant
+) -> None:
+    import pytest
+
+    from tests.services.chat.question_log_capture import parsed, question_records
+
+    project, user = await _project_and_user(db, tenant_a)
+    rewrite = _rewrite_response(query=QUESTION)
+    rewrite.usage = UsageInfo(
+        prompt_tokens=1_000_000, completion_tokens=500_000, total_tokens=1_500_000
+    )
+
+    with (
+        question_records() as records,
+        _patched_qdrant(_raising_qdrant("Qdrant unreachable")),
+        _patched_mistral(rewrite_response=rewrite),
+    ):
+        events = await _stream(db, tenant_id=tenant_a.id, project_id=project.id, user_id=user.id)
+
+    assert [_kind(e) for e in events] == ["conversation_id", "error", "DONE"]
+    assert len(records) == 1
+    record = parsed(records)[0]
+    assert record["outcome"] == "search_error"
+    legs = record["legs"]
+    assert isinstance(legs, dict)
+    assert legs["rewrite"]["cost_usd"] == pytest.approx(1.25)
+    assert record["cost_usd"] == pytest.approx(1.25)
+
+
+async def test_record_latency_and_ttft_are_non_negative_and_ttft_not_above_latency(
+    db: AsyncSession, tenant_a: Tenant
+) -> None:
+    from tests.services.chat.question_log_capture import parsed, question_records
+
+    with question_records() as records:
+        await _happy_path(db, tenant_a)
+
+    assert len(records) == 1
+    record = parsed(records)[0]
+    latency_ms = record["latency_ms"]
+    ttft_ms = record["ttft_ms"]
+    assert isinstance(latency_ms, int) and latency_ms >= 0
+    assert isinstance(ttft_ms, int) and ttft_ms >= 0
+    assert ttft_ms <= latency_ms
+
+
+async def test_generation_exception_after_first_token_emits_one_failed_record_and_still_propagates(
+    db: AsyncSession, tenant_a: Tenant
+) -> None:
+    import pytest
+
+    from tests.services.chat.question_log_capture import (
+        parsed,
+        question_records,
+        stream_raising_after_first_token,
+    )
+
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(
+        [_chunk_point(tenant_id=tenant_a.id, project_id=project.id, text=MAIN_CHUNK_TEXT)]
+    )
+
+    with (
+        question_records() as records,
+        _patched_qdrant(fake),
+        _patched_mistral(rewrite_response=_rewrite_response(query=QUESTION)),
+        stream_raising_after_first_token(STREAM_TOKENS[0]),
+        pytest.raises(RuntimeError, match="Mistral stream dropped"),
+    ):
+        await _stream(db, tenant_id=tenant_a.id, project_id=project.id, user_id=user.id)
+
+    assert len(records) == 1
+    record = parsed(records)[0]
+    assert record["outcome"] == "failed"
+    assert record["ttft_ms"] is not None
+
+
+async def test_closing_the_stream_after_first_text_event_emits_one_failed_record(
+    db: AsyncSession, tenant_a: Tenant
+) -> None:
+    from app.services.chat.graph import chat_stream
+    from tests.services.chat.question_log_capture import parsed, question_records
+
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(
+        [_chunk_point(tenant_id=tenant_a.id, project_id=project.id, text=MAIN_CHUNK_TEXT)]
+    )
+
+    with (
+        question_records() as records,
+        _patched_qdrant(fake),
+        _patched_mistral(rewrite_response=_rewrite_response(query=QUESTION)),
+    ):
+        agen = chat_stream(
+            db,
+            tenant_id=tenant_a.id,
+            project_id=project.id,
+            user_id=user.id,
+            question=QUESTION,
+        )
+        async for line in agen:
+            if line.startswith('data: {"text"'):
+                break
+        await agen.aclose()
+
+    assert len(records) == 1
+    record = parsed(records)[0]
+    assert record["outcome"] == "failed"
+    assert record["ttft_ms"] is not None
+
+
+async def test_no_log_record_at_any_level_contains_the_question_text_on_happy_and_search_error_paths(
+    db: AsyncSession, tenant_a: Tenant, caplog: LogCaptureFixture
+) -> None:
+    import logging
+
+    from tests.services.chat.question_log_capture import question_records
+
+    caplog.set_level(logging.DEBUG, logger="app")
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(
+        [_chunk_point(tenant_id=tenant_a.id, project_id=project.id, text=MAIN_CHUNK_TEXT)]
+    )
+    rewrite = _rewrite_response(query=QUESTION)
+
+    with question_records() as records:
+        with _patched_qdrant(fake), _patched_mistral(rewrite_response=rewrite):
+            await _stream(db, tenant_id=tenant_a.id, project_id=project.id, user_id=user.id)
+        with (
+            _patched_qdrant(_raising_qdrant("Qdrant unreachable")),
+            _patched_mistral(rewrite_response=rewrite),
+        ):
+            await _stream(db, tenant_id=tenant_a.id, project_id=project.id, user_id=user.id)
+
+    assert len(records) == 2
+    assert all(json.loads(r.getMessage())["event"] == "chat_question" for r in records)
+    for record in [*records, *caplog.records]:
+        assert QUESTION not in record.getMessage()
+        assert QUESTION not in str(record.args)
+        assert QUESTION not in str(record.exc_text)
+    assert QUESTION not in caplog.text
+
+
+async def test_client_sse_events_are_unchanged_by_the_logging(
+    db: AsyncSession, tenant_a: Tenant
+) -> None:
+    from tests.services.chat.question_log_capture import question_records
+
+    with question_records():
+        events, _ = await _happy_path(db, tenant_a)
+
+    assert [_kind(e) for e in events] == [
+        "conversation_id",
+        "text",
+        "text",
+        "sources",
+        "usage",
+        "DONE",
+    ]

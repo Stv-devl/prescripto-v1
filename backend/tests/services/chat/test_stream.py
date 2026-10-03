@@ -1,4 +1,4 @@
-from mistralai.models import UsageInfo
+from mistralai.client.models import UsageInfo
 
 from app.services.chat.stream import _usage_event, _usage_leg
 
