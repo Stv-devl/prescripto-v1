@@ -231,3 +231,68 @@ def test_tenant_and_conversation_ids_are_serialised_as_strings() -> None:
 
     assert record["tenant_id"] == "11111111-1111-1111-1111-111111111111"
     assert record["conversation_id"] == "22222222-2222-2222-2222-222222222222"
+
+
+def _build_timed(
+    timings: Mapping[str, object] | None, state: Mapping[str, object] | None = None
+) -> dict[str, object]:
+    return build_question_record(
+        state={"context_block": "ctx"} if state is None else state,
+        usage=V1_USAGE,
+        mode="v1",
+        tenant_id=TENANT,
+        conversation_id=CONVERSATION,
+        latency_ms=5230,
+        ttft_ms=1840,
+        failed=False,
+        timings=timings,  # type: ignore[arg-type]
+    )
+
+
+def test_record_carries_step_timings_when_given() -> None:
+    record = _build_timed({"rewrite_ms": 812, "search_ms": 430})
+
+    assert record["rewrite_ms"] == 812
+    assert record["search_ms"] == 430
+
+
+def test_record_keys_with_timings_are_contract_keys_plus_timing_keys() -> None:
+    record = _build_timed({"rewrite_ms": 812, "search_ms": 430})
+
+    assert set(record) == CONTRACT_KEYS | {"rewrite_ms", "search_ms"}
+
+
+def test_record_without_timings_is_unchanged() -> None:
+    record = _build_timed(None)
+
+    assert set(record) == CONTRACT_KEYS
+
+
+def test_record_with_timings_still_carries_no_text() -> None:
+    state = {
+        "context_block": "SENTINEL_CONTEXT",
+        "question": "SENTINEL_QUESTION",
+        "full_response": "SENTINEL_ANSWER",
+        "search_query": "SENTINEL_QUERY",
+        "scope": "broad",
+    }
+
+    dumped = json.dumps(_build_timed({"rewrite_ms": 812, "generate_ms": 4100}, state=state))
+
+    assert "SENTINEL" not in dumped
+
+
+def test_record_rejects_non_integer_or_non_ms_timings() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        _build_timed({"rewrite_ms": "812"})
+    with pytest.raises(ValueError):
+        _build_timed({"question": 3})
+
+
+def test_record_rejects_a_timing_key_that_shadows_a_contract_key() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        _build_timed({"latency_ms": 5})

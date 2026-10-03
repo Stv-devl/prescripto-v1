@@ -32,15 +32,17 @@ def build_question_record(
     latency_ms: int,
     ttft_ms: int | None,
     failed: bool,
+    timings: Mapping[str, int] | None = None,
 ) -> dict[str, object]:
     """Build the JSON-serialisable `chat_question` record for one question.
 
     Top-level tokens and cost are `usage["total"]`; `legs` holds every other usage key
     as-is. `judged` is true as soon as the judge node wrote `judgment_missing`, even as
-    None (sufficient)."""
+    None (sufficient). `timings`, when given, adds one integer `<step>_ms` key per step
+    and may not shadow a contract key."""
     total = usage["total"]
     scope = state.get("scope")
-    return {
+    record: dict[str, object] = {
         "event": "chat_question",
         "tenant_id": str(tenant_id),
         "conversation_id": str(conversation_id),
@@ -57,3 +59,8 @@ def build_question_record(
         "cost_usd": total["cost_usd"],
         "legs": {name: dict(leg) for name, leg in usage.items() if name != "total"},
     }
+    for key, value in (timings or {}).items():
+        if not key.endswith("_ms") or key in record or type(value) is not int:
+            raise ValueError(f"invalid step timing field: {key!r}")
+        record[key] = value
+    return record
