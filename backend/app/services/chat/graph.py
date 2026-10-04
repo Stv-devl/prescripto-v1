@@ -8,6 +8,7 @@ docs/work/j1-langgraph-orchestration/plan.md, Decisions: db/tenant_id/project_id
 are closures bound per request in _build_graph(), never state fields.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -509,6 +510,12 @@ class ChatState(TypedDict, total=False):
 
 def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUID) -> object:
     """Compiles a fresh graph, bound by closure to this one request's db/ids."""
+    generation_reserved = asyncio.Event()
+
+    async def _after_generation_reserved() -> None:
+        """In v1, hold an extraction until the generation has reserved its large-limiter slot."""
+        if settings.retrieval_mode == "v1":
+            await generation_reserved.wait()
 
     @traceable(name="rewrite_node")
     async def rewrite_node(state: ChatState) -> dict[str, object]:
@@ -609,6 +616,12 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
 
     @traceable(name="generate_node")
     async def generate_node(state: ChatState) -> dict[str, object]:
+        try:
+            return await _generate(state)
+        finally:
+            generation_reserved.set()
+
+    async def _generate(state: ChatState) -> dict[str, object]:
         with timing.step(GENERATE):
             writer = get_stream_writer()
             full_response = ""
@@ -616,6 +629,7 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
 
             cache_key = prompt_cache_key(settings.retrieval_mode, "generation")
             cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
+            generation_reserved.set()
             await mistral_large_limiter.wait()
             generation_started = time.perf_counter()
             first_token_at: float | None = None
@@ -646,6 +660,7 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     async def extract_table_node(state: ChatState) -> dict[str, object]:
         with timing.step(EXTRACT_TABLE):
             table_usage: list[tuple[str, UsageInfo]] = []
+            await _after_generation_reserved()
             table = await extract_table(
                 state["context_block"], state["question"], usage_sink=table_usage
             )
@@ -655,6 +670,7 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     async def extract_schema_node(state: ChatState) -> dict[str, object]:
         with timing.step(EXTRACT_SCHEMA):
             schema_usage: list[tuple[str, UsageInfo]] = []
+            await _after_generation_reserved()
             schema = await extract_schema(
                 state["context_block"], state["question"], usage_sink=schema_usage
             )
