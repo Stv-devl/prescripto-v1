@@ -1,8 +1,8 @@
-"""Order in which one chat question passes the shared Mistral rate limiters.
+"""Guards kept after `chat-generation-priority` was withdrawn (2026-10-04).
 
-The only observable trace of the choice "generation reserves the large limiter
-before the extractions" is the order of the `wait()` passages, recorded here by
-step name, so the call log is the assertion (same exception as `test_graph.py`).
+The v1 "generation first" cases left with the code; what remains pins the
+baseline large-limiter order, the table event after the answer text, and a
+generation failure that never leaves the extractions hanging.
 """
 
 import asyncio
@@ -120,45 +120,7 @@ async def _passages_for(
     return passages
 
 
-# ── Core behaviour ────────────────────────────────────────────────
-
-
-async def test_v1_table_and_schema_question_reserves_the_generation_before_both_extractions(
-    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _pin_settings(monkeypatch, "v1")
-
-    passages = await _passages_for(db, tenant_a, structured="table", schema="schema")
-
-    large = passages.large
-    assert len(large) == 4, f"large limiter passages: {large}"
-    assert large[:2] == ["rewrite", "generate"], f"large limiter passages: {large}"
-    assert set(large[2:]) == {"extract_table", "extract_schema"}, f"large limiter passages: {large}"
-
-
-async def test_v1_table_question_reserves_the_generation_before_the_table_extraction(
-    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _pin_settings(monkeypatch, "v1")
-
-    passages = await _passages_for(db, tenant_a, structured="table", schema="none")
-
-    assert passages.large == ["rewrite", "generate", "extract_table"], (
-        f"large limiter passages: {passages.large}"
-    )
-
-
 # ── Business rules ────────────────────────────────────────────────
-
-
-async def test_v1_question_without_extraction_keeps_rewrite_then_generation(
-    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _pin_settings(monkeypatch, "v1")
-
-    passages = await _passages_for(db, tenant_a, structured="none", schema="none")
-
-    assert passages.large == ["rewrite", "generate"], f"large limiter passages: {passages.large}"
 
 
 async def test_v1_table_question_still_emits_the_table_after_the_answer_text(

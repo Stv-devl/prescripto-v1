@@ -8,7 +8,6 @@ docs/work/j1-langgraph-orchestration/plan.md, Decisions: db/tenant_id/project_id
 are closures bound per request in _build_graph(), never state fields.
 """
 
-import asyncio
 import json
 import logging
 import re
@@ -510,21 +509,19 @@ class ChatState(TypedDict, total=False):
 
 def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUID) -> object:
     """Compiles a fresh graph, bound by closure to this one request's db/ids."""
-    generation_reserved = asyncio.Event()
-
-    async def _after_generation_reserved() -> None:
-        """In v1, hold an extraction until the generation has reserved its large-limiter slot."""
-        if settings.retrieval_mode == "v1":
-            await generation_reserved.wait()
 
     @traceable(name="rewrite_node")
     async def rewrite_node(state: ChatState) -> dict[str, object]:
         with timing.step(REWRITE):
             rewrite_usage: list[UsageInfo] = []
             history = [SimpleNamespace(**m) for m in state["history_for_rewrite"]]
-            search_query, related_queries, _llm_scope, structured, schema_flag = await rewrite_query(
-                state["question"], history, usage_sink=rewrite_usage
-            )
+            (
+                search_query,
+                related_queries,
+                _llm_scope,
+                structured,
+                schema_flag,
+            ) = await rewrite_query(state["question"], history, usage_sink=rewrite_usage)
 
             scope = classify_scope(state["question"])
             if scope == "broad":
@@ -535,7 +532,9 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
                 structured = "none"
                 schema_flag = "none"
             else:
-                search_limit = narrow_search_limit(settings.retrieval_mode, settings.v1_search_limit)
+                search_limit = narrow_search_limit(
+                    settings.retrieval_mode, settings.v1_search_limit
+                )
                 context_max = CONTEXT_MAX_CHARS
                 score_threshold = 0.40
                 max_sources = MAX_DISPLAYED_SOURCES
@@ -616,12 +615,6 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
 
     @traceable(name="generate_node")
     async def generate_node(state: ChatState) -> dict[str, object]:
-        try:
-            return await _generate(state)
-        finally:
-            generation_reserved.set()
-
-    async def _generate(state: ChatState) -> dict[str, object]:
         with timing.step(GENERATE):
             writer = get_stream_writer()
             full_response = ""
@@ -629,7 +622,6 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
 
             cache_key = prompt_cache_key(settings.retrieval_mode, "generation")
             cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
-            generation_reserved.set()
             await mistral_large_limiter.wait()
             generation_started = time.perf_counter()
             first_token_at: float | None = None
@@ -660,7 +652,6 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     async def extract_table_node(state: ChatState) -> dict[str, object]:
         with timing.step(EXTRACT_TABLE):
             table_usage: list[tuple[str, UsageInfo]] = []
-            await _after_generation_reserved()
             table = await extract_table(
                 state["context_block"], state["question"], usage_sink=table_usage
             )
@@ -670,7 +661,6 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     async def extract_schema_node(state: ChatState) -> dict[str, object]:
         with timing.step(EXTRACT_SCHEMA):
             schema_usage: list[tuple[str, UsageInfo]] = []
-            await _after_generation_reserved()
             schema = await extract_schema(
                 state["context_block"], state["question"], usage_sink=schema_usage
             )
@@ -715,12 +705,17 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
                     question=retry_query,
                     related_queries=[],
                     scope="specific",
-                    search_limit=narrow_search_limit(settings.retrieval_mode, settings.v1_search_limit),
+                    search_limit=narrow_search_limit(
+                        settings.retrieval_mode, settings.v1_search_limit
+                    ),
                 )
             except Exception:
                 logger.exception("Retry search failed, serving the first search results")
                 return {"retried": True}
-            return {"search_results": merge_results(state["search_results"], second), "retried": True}
+            return {
+                "search_results": merge_results(state["search_results"], second),
+                "retried": True,
+            }
 
     async def error_node(state: ChatState) -> dict[str, object]:
         writer = get_stream_writer()
