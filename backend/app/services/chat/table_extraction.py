@@ -5,8 +5,11 @@ import logging
 import re
 import unicodedata
 
+from mistralai.client.models import UsageInfo
+
 from app.core.mistral import mistral_client, mistral_large_limiter
 from app.schemas.chat import StructuredTable
+from app.services.chat.model_routing import LARGE_MODEL
 from app.services.chat.prompts import TABLE_EXTRACTION_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -117,8 +120,13 @@ def _merge_duplicate_rows(
 async def extract_table(
     context_block: str,
     question: str,
+    *,
+    usage_sink: list[tuple[str, UsageInfo]] | None = None,
 ) -> StructuredTable | None:
-    """Extract a structured table from context via Mistral Large."""
+    """Extract a structured table from context via Mistral.
+
+    usage_sink, when given, receives (model called, token usage) for the call."""
+    model = LARGE_MODEL
     try:
         reordered = _reorder_context_for_table(context_block)
         truncated_context = reordered[:TABLE_CONTEXT_LIMIT]
@@ -131,7 +139,7 @@ async def extract_table(
 
         await mistral_large_limiter.wait()
         response = await mistral_client.chat.complete_async(
-            model="mistral-large-latest",
+            model=model,
             messages=[
                 {"role": "system", "content": TABLE_EXTRACTION_PROMPT},
                 {
@@ -145,6 +153,8 @@ async def extract_table(
             max_tokens=800,
             response_format={"type": "json_object"},
         )
+        if usage_sink is not None and response.usage is not None:
+            usage_sink.append((model, response.usage))
         raw = response.choices[0].message.content  # type: ignore[union-attr]
         logger.debug(f"[TABLE DEBUG] Raw LLM response: {len(raw) if raw else 0} chars")
         if not raw:

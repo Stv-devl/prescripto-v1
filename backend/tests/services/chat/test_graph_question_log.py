@@ -323,3 +323,99 @@ async def test_no_token_records_no_generation_submeasures(
     assert "generate_ms" in record
     assert "generate_first_token_ms" not in record
     assert "generate_stream_ms" not in record
+
+
+async def _extraction_question(
+    db: AsyncSession,
+    tenant: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    structured: str = "table",
+    schema: str = "none",
+) -> tuple[dict[str, object], list[dict[str, object] | str]]:
+    from mistralai.client.models import UsageInfo
+
+    from tests.services.chat.question_log_capture import parsed, question_records
+
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-large-latest")
+    project, user = await _project_and_user(db, tenant)
+    question = "Quel type de béton pour les semelles ?"
+    fake = FakeQdrant([_chunk_point(tenant_id=tenant.id, project_id=project.id, text=CONTEXT_TEXT)])
+    table_response = _table_response(
+        title="Semelles",
+        rows=[{"element": "Semelle", "description": "C25/30", "quantite": "", "localisation": ""}],
+    )
+    table_response.usage = UsageInfo(prompt_tokens=1000, completion_tokens=200, total_tokens=1200)
+    with (
+        question_records() as records,
+        _patched_qdrant(fake),
+        _patched_mistral(
+            rewrite_response=_rewrite_response(
+                query=question, structured=structured, schema=schema
+            ),
+            table_response=table_response,
+        ),
+    ):
+        events = await _stream(
+            db, tenant_id=tenant.id, project_id=project.id, user_id=user.id, question=question
+        )
+    lines = parsed(records)
+    assert len(lines) == 1
+    return lines[0], events
+
+
+async def test_table_question_record_carries_an_extraction_leg_priced_large_in_v1(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record, _ = await _extraction_question(db, tenant_a, monkeypatch)
+
+    legs = record["legs"]
+    assert legs["extraction"] == {  # type: ignore[index]
+        "input_tokens": 1000,
+        "cached_tokens": 0,
+        "output_tokens": 200,
+        "cost_usd": pytest.approx(0.0008),
+    }
+    assert record["cost_usd"] == pytest.approx(
+        sum(leg["cost_usd"] for leg in legs.values())  # type: ignore[union-attr]
+    )
+
+
+async def test_question_without_extraction_has_no_extraction_leg(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record, _ = await _extraction_question(db, tenant_a, monkeypatch, structured="none")
+
+    assert "extraction" not in record["legs"]  # type: ignore[operator]
+
+
+async def test_table_question_usage_event_carries_the_extraction_leg(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record, events = await _extraction_question(db, tenant_a, monkeypatch)
+
+    usage_events = [e for e in events if isinstance(e, dict) and "usage" in e]
+    assert len(usage_events) == 1
+    assert usage_events[0]["usage"]["extraction"] == record["legs"]["extraction"]  # type: ignore[index]
+
+
+async def test_v1_table_and_schema_question_waits_on_the_large_limiter_for_every_call(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from app.core.mistral import mistral_fast_limiter, mistral_large_limiter
+
+    with (
+        patch.object(mistral_large_limiter, "wait", new_callable=AsyncMock) as large_wait,
+        patch.object(mistral_fast_limiter, "wait", new_callable=AsyncMock) as fast_wait,
+    ):
+        record, _ = await _extraction_question(
+            db, tenant_a, monkeypatch, structured="table", schema="schema"
+        )
+
+    assert record["judged"] is False
+    assert large_wait.await_count == 4
+    assert fast_wait.await_count == 0

@@ -146,28 +146,28 @@ def _usage_event(
     *,
     short_call_price: Price | None = None,
     rewrite_price: Price | None = None,
+    extraction: list[tuple[str, UsageInfo]] | None = None,
 ) -> dict[str, object]:
-    """Build the {rewrite, generation, [agent,] total} usage payload for the SSE stream.
+    """Build the {rewrite, generation, [agent,] [extraction,] total} usage payload for the SSE stream.
 
     `agent` (judge + reformulation calls) is passed in v1 only; without it the payload
     keeps its three-key baseline shape. `short_call_price` prices the agent legs (the fast
     model in v1) and, unless `rewrite_price` is given, the rewrite leg; generation is always
-    priced as mistral-large.
+    priced as mistral-large. `extraction` holds (model called, usage) for each table/schema
+    extraction, each priced at its own model; the leg appears only when it is non-empty.
     """
     short_price = short_call_price or MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
-    rewrite_leg = _usage_leg(rewrite, rewrite_price or short_price)
-    generation_leg = _usage_leg(generation)
-    if agent is None:
-        total = _sum_legs([rewrite_leg, generation_leg])
-        return {"rewrite": rewrite_leg, "generation": generation_leg, "total": total}
-    agent_leg = _sum_legs([_usage_leg(usage, short_price) for usage in agent])
-    total = _sum_legs([rewrite_leg, generation_leg, agent_leg])
-    return {
-        "rewrite": rewrite_leg,
-        "generation": generation_leg,
-        "agent": agent_leg,
-        "total": total,
+    legs: dict[str, dict[str, int | float]] = {
+        "rewrite": _usage_leg(rewrite, rewrite_price or short_price),
+        "generation": _usage_leg(generation),
     }
+    if agent is not None:
+        legs["agent"] = _sum_legs([_usage_leg(usage, short_price) for usage in agent])
+    if extraction:
+        legs["extraction"] = _sum_legs(
+            [_usage_leg(usage, price_for(model)) for model, usage in extraction]
+        )
+    return {**legs, "total": _sum_legs(list(legs.values()))}
 
 
 def _normalize_for_dedup(text: str) -> str:
@@ -503,6 +503,8 @@ class ChatState(TypedDict, total=False):
     retry_query: str | None
     retried: bool
     agent_usage: list[UsageInfo]
+    table_usage: list[tuple[str, UsageInfo]]
+    schema_usage: list[tuple[str, UsageInfo]]
 
 
 def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUID) -> object:
@@ -643,20 +645,26 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
     @traceable(name="extract_table_node")
     async def extract_table_node(state: ChatState) -> dict[str, object]:
         with timing.step(EXTRACT_TABLE):
-            table = await extract_table(state["context_block"], state["question"])
-            return {"table": table}
+            table_usage: list[tuple[str, UsageInfo]] = []
+            table = await extract_table(
+                state["context_block"], state["question"], usage_sink=table_usage
+            )
+            return {"table": table, "table_usage": table_usage}
 
     @traceable(name="extract_schema_node")
     async def extract_schema_node(state: ChatState) -> dict[str, object]:
         with timing.step(EXTRACT_SCHEMA):
-            schema = await extract_schema(state["context_block"], state["question"])
+            schema_usage: list[tuple[str, UsageInfo]] = []
+            schema = await extract_schema(
+                state["context_block"], state["question"], usage_sink=schema_usage
+            )
             if schema and schema.schema_type == "semelle_filante":
                 missing = {"fond_fouille", "gros_beton", "bon_sol"} - set(schema.params)
                 if missing or "fond_fouille" in schema.params:
                     schema = await enrich_schema_with_search(
                         schema, tenant_id=tenant_id, project_id=project_id
                     )
-            return {"schema_result": schema}
+            return {"schema_result": schema, "schema_usage": schema_usage}
 
     @traceable(name="judge_node")
     async def judge_node(state: ChatState) -> dict[str, object]:
@@ -728,6 +736,8 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
                     "rewrite_usage": state.get("rewrite_usage"),
                     "generation_usage": state.get("generation_usage"),
                     "agent_usage": state.get("agent_usage"),
+                    "table_usage": state.get("table_usage"),
+                    "schema_usage": state.get("schema_usage"),
                 }
             }
         )
@@ -895,10 +905,15 @@ def _elapsed_ms(started: float) -> int:
 
 
 def _question_usage(values: Mapping[str, object]) -> dict[str, object]:
-    """The {rewrite, generation, [agent,] total} usage of one question, priced per mode.
+    """The {rewrite, generation, [agent,] [extraction,] total} usage of one question, priced per mode.
 
     `values` is the `__final__` payload or the graph's final state: both carry the
-    `rewrite_usage` / `generation_usage` / `agent_usage` keys, possibly unset."""
+    `rewrite_usage` / `generation_usage` / `agent_usage` / `table_usage` / `schema_usage`
+    keys, possibly unset."""
+    extraction: list[tuple[str, UsageInfo]] = [
+        *(values.get("table_usage") or []),  # type: ignore[misc]
+        *(values.get("schema_usage") or []),  # type: ignore[misc]
+    ]
     agent_usage: list[UsageInfo] | None = None
     short_call_price: Price | None = None
     rewrite_price: Price | None = None
@@ -912,6 +927,7 @@ def _question_usage(values: Mapping[str, object]) -> dict[str, object]:
         agent_usage,
         short_call_price=short_call_price,
         rewrite_price=rewrite_price,
+        extraction=extraction,
     )
 
 

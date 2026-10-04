@@ -1199,3 +1199,52 @@ async def test_v1_narrow_question_record_has_judged_false(
     record = parsed(records)[0]
     assert record["mode"] == "v1"
     assert record["judged"] is False
+
+
+async def test_usage_event_with_extraction_usage_adds_an_extraction_leg_in_the_total() -> None:
+    extraction = UsageInfo(prompt_tokens=1000, completion_tokens=200, total_tokens=1200)
+    generation = UsageInfo(prompt_tokens=2_000_000, completion_tokens=0, total_tokens=2_000_000)
+
+    event = _usage_event(None, generation, extraction=[("mistral-small-latest", extraction)])
+
+    assert event["extraction"] == {
+        "input_tokens": 1000,
+        "cached_tokens": 0,
+        "output_tokens": 200,
+        "cost_usd": pytest.approx(0.00027),
+    }
+    assert event["total"] == {
+        "input_tokens": 2_001_000,
+        "cached_tokens": 0,
+        "output_tokens": 200,
+        "cost_usd": pytest.approx(1.00027),
+    }
+
+
+async def test_usage_event_prices_each_extraction_at_the_model_it_called() -> None:
+    extraction = UsageInfo(prompt_tokens=1000, completion_tokens=200, total_tokens=1200)
+
+    event = _usage_event(
+        None,
+        None,
+        extraction=[("mistral-large-latest", extraction), ("mistral-small-latest", extraction)],
+    )
+
+    assert event["extraction"]["cost_usd"] == pytest.approx(0.00107)  # type: ignore[index]
+    assert event["total"]["cost_usd"] == pytest.approx(0.00107)  # type: ignore[index]
+
+
+async def test_usage_event_without_extraction_keeps_todays_shape() -> None:
+    generation = UsageInfo(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+
+    assert list(_usage_event(None, generation, extraction=None)) == [
+        "rewrite",
+        "generation",
+        "total",
+    ]
+    assert list(_usage_event(None, generation, agent=[], extraction=[])) == [
+        "rewrite",
+        "generation",
+        "agent",
+        "total",
+    ]
