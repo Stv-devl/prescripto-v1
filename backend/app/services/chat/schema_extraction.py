@@ -5,10 +5,13 @@ import logging
 import re
 import uuid
 
+from mistralai.client.models import UsageInfo
+
 from app.core.mistral import mistral_client, mistral_large_limiter
 from app.schemas.chat import StructuredSchema
 from app.schemas.search import SearchFilters
 from app.services import search as search_service
+from app.services.chat.model_routing import LARGE_MODEL
 from app.services.chat.prompts import (
     SCHEMA_EXTRACTION_PROMPT,
     SCHEMA_TYPES,
@@ -68,12 +71,17 @@ def _strip_non_precise(params: dict[str, str]) -> dict[str, str]:
 async def extract_schema(
     context_block: str,
     question: str,
+    *,
+    usage_sink: list[tuple[str, UsageInfo]] | None = None,
 ) -> StructuredSchema | None:
-    """Extract a parametric schema description from context via Mistral Large."""
+    """Extract a parametric schema description from context via Mistral.
+
+    usage_sink, when given, receives (model called, token usage) for the call."""
+    model = LARGE_MODEL
     try:
         await mistral_large_limiter.wait()
         response = await mistral_client.chat.complete_async(
-            model="mistral-large-latest",
+            model=model,
             messages=[
                 {"role": "system", "content": SCHEMA_EXTRACTION_PROMPT},
                 {
@@ -87,6 +95,8 @@ async def extract_schema(
             max_tokens=800,
             response_format={"type": "json_object"},
         )
+        if usage_sink is not None and response.usage is not None:
+            usage_sink.append((model, response.usage))
         raw = response.choices[0].message.content  # type: ignore[union-attr]
         if not raw:
             logger.debug("[SCHEMA DEBUG] LLM returned empty response")

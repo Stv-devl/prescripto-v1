@@ -9,6 +9,7 @@ import time
 
 from mistralai.client import Mistral
 
+from app.core import timing
 from app.core.config import settings
 
 mistral_client = Mistral(api_key=settings.mistral_api_key)
@@ -24,13 +25,17 @@ class _RateLimiter:
         self._lock = asyncio.Lock()
         self._next_slot = 0.0
 
-    async def wait(self) -> None:
+    async def wait(self) -> float:
         async with self._lock:
             now = time.monotonic()
             delay = max(0.0, self._next_slot - now)
             self._next_slot = max(now, self._next_slot) + self._min_interval
         if delay:
             await asyncio.sleep(delay)
+        step = timing.current_step()
+        if step is not None:
+            timing.record(f"{step}_wait", int(delay * 1000))
+        return delay
 
 
 mistral_large_limiter = _RateLimiter(requests_per_second=0.25)

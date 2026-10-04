@@ -25,6 +25,7 @@ from mistralai.client.models import UsageInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import timing
 from app.core.config import settings
 from app.core.langsmith import configure_langsmith
 from app.core.log_config import QUESTION_LOGGER
@@ -68,6 +69,20 @@ from app.services.chat.query_rewrite import rewrite_query
 from app.services.chat.question_log import build_question_record
 from app.services.chat.schema_extraction import enrich_schema_with_search, extract_schema
 from app.services.chat.search_limits import narrow_search_limit, query_limits
+from app.services.chat.step_timing import (
+    ENRICH,
+    ENRICH_RETRY,
+    EXTRACT_SCHEMA,
+    EXTRACT_TABLE,
+    GENERATE,
+    GENERATE_FIRST_TOKEN,
+    GENERATE_STREAM,
+    JUDGE,
+    RETRY_SEARCH,
+    REWRITE,
+    SEARCH,
+    step_fields,
+)
 from app.services.chat.sufficiency import (
     judge_sufficiency,
     merge_results,
@@ -131,28 +146,28 @@ def _usage_event(
     *,
     short_call_price: Price | None = None,
     rewrite_price: Price | None = None,
+    extraction: list[tuple[str, UsageInfo]] | None = None,
 ) -> dict[str, object]:
-    """Build the {rewrite, generation, [agent,] total} usage payload for the SSE stream.
+    """Build the {rewrite, generation, [agent,] [extraction,] total} usage payload for the SSE stream.
 
     `agent` (judge + reformulation calls) is passed in v1 only; without it the payload
     keeps its three-key baseline shape. `short_call_price` prices the agent legs (the fast
     model in v1) and, unless `rewrite_price` is given, the rewrite leg; generation is always
-    priced as mistral-large.
+    priced as mistral-large. `extraction` holds (model called, usage) for each table/schema
+    extraction, each priced at its own model; the leg appears only when it is non-empty.
     """
     short_price = short_call_price or MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
-    rewrite_leg = _usage_leg(rewrite, rewrite_price or short_price)
-    generation_leg = _usage_leg(generation)
-    if agent is None:
-        total = _sum_legs([rewrite_leg, generation_leg])
-        return {"rewrite": rewrite_leg, "generation": generation_leg, "total": total}
-    agent_leg = _sum_legs([_usage_leg(usage, short_price) for usage in agent])
-    total = _sum_legs([rewrite_leg, generation_leg, agent_leg])
-    return {
-        "rewrite": rewrite_leg,
-        "generation": generation_leg,
-        "agent": agent_leg,
-        "total": total,
+    legs: dict[str, dict[str, int | float]] = {
+        "rewrite": _usage_leg(rewrite, rewrite_price or short_price),
+        "generation": _usage_leg(generation),
     }
+    if agent is not None:
+        legs["agent"] = _sum_legs([_usage_leg(usage, short_price) for usage in agent])
+    if extraction:
+        legs["extraction"] = _sum_legs(
+            [_usage_leg(usage, price_for(model)) for model, usage in extraction]
+        )
+    return {**legs, "total": _sum_legs(list(legs.values()))}
 
 
 def _normalize_for_dedup(text: str) -> str:
@@ -488,6 +503,8 @@ class ChatState(TypedDict, total=False):
     retry_query: str | None
     retried: bool
     agent_usage: list[UsageInfo]
+    table_usage: list[tuple[str, UsageInfo]]
+    schema_usage: list[tuple[str, UsageInfo]]
 
 
 def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUID) -> object:
@@ -495,176 +512,210 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
 
     @traceable(name="rewrite_node")
     async def rewrite_node(state: ChatState) -> dict[str, object]:
-        rewrite_usage: list[UsageInfo] = []
-        history = [SimpleNamespace(**m) for m in state["history_for_rewrite"]]
-        search_query, related_queries, _llm_scope, structured, schema_flag = await rewrite_query(
-            state["question"], history, usage_sink=rewrite_usage
-        )
+        with timing.step(REWRITE):
+            rewrite_usage: list[UsageInfo] = []
+            history = [SimpleNamespace(**m) for m in state["history_for_rewrite"]]
+            (
+                search_query,
+                related_queries,
+                _llm_scope,
+                structured,
+                schema_flag,
+            ) = await rewrite_query(state["question"], history, usage_sink=rewrite_usage)
 
-        scope = classify_scope(state["question"])
-        if scope == "broad":
-            search_limit = 20
-            context_max = 48000
-            score_threshold = 0.30
-            max_sources = 10
-            structured = "none"
-            schema_flag = "none"
-        else:
-            search_limit = narrow_search_limit(settings.retrieval_mode, settings.v1_search_limit)
-            context_max = CONTEXT_MAX_CHARS
-            score_threshold = 0.40
-            max_sources = MAX_DISPLAYED_SOURCES
+            scope = classify_scope(state["question"])
+            if scope == "broad":
+                search_limit = 20
+                context_max = 48000
+                score_threshold = 0.30
+                max_sources = 10
+                structured = "none"
+                schema_flag = "none"
+            else:
+                search_limit = narrow_search_limit(
+                    settings.retrieval_mode, settings.v1_search_limit
+                )
+                context_max = CONTEXT_MAX_CHARS
+                score_threshold = 0.40
+                max_sources = MAX_DISPLAYED_SOURCES
 
-        if schema_flag == "none" and (
-            FORCED_SCHEMA_RE.search(state["question"])
-            or (search_query and FORCED_SCHEMA_RE.search(search_query))
-        ):
-            schema_flag = "schema"
+            if schema_flag == "none" and (
+                FORCED_SCHEMA_RE.search(state["question"])
+                or (search_query and FORCED_SCHEMA_RE.search(search_query))
+            ):
+                schema_flag = "schema"
 
-        return {
-            "search_query": search_query,
-            "related_queries": related_queries,
-            "scope": scope,
-            "structured": structured,
-            "schema_flag": schema_flag,
-            "search_limit": search_limit,
-            "context_max": context_max,
-            "score_threshold": score_threshold,
-            "max_sources": max_sources,
-            "rewrite_usage": rewrite_usage[0] if rewrite_usage else None,
-        }
+            return {
+                "search_query": search_query,
+                "related_queries": related_queries,
+                "scope": scope,
+                "structured": structured,
+                "schema_flag": schema_flag,
+                "search_limit": search_limit,
+                "context_max": context_max,
+                "score_threshold": score_threshold,
+                "max_sources": max_sources,
+                "rewrite_usage": rewrite_usage[0] if rewrite_usage else None,
+            }
 
     @traceable(name="search_node")
     async def search_node(state: ChatState) -> dict[str, object]:
-        try:
-            search_results = await _run_search(
-                tenant_id=tenant_id,
-                project_id=project_id,
-                search_query=state["search_query"],
-                question=state["question"],
-                related_queries=state["related_queries"],
-                scope=state["scope"],
-                search_limit=state["search_limit"],
-            )
-        except Exception:
-            logger.exception("Search failed")
-            return {"error": SEARCH_ERROR_MESSAGE}
-        return {"search_results": search_results}
+        with timing.step(SEARCH):
+            try:
+                search_results = await _run_search(
+                    tenant_id=tenant_id,
+                    project_id=project_id,
+                    search_query=state["search_query"],
+                    question=state["question"],
+                    related_queries=state["related_queries"],
+                    scope=state["scope"],
+                    search_limit=state["search_limit"],
+                )
+            except Exception:
+                logger.exception("Search failed")
+                return {"error": SEARCH_ERROR_MESSAGE}
+            return {"search_results": search_results}
 
     @traceable(name="enrich_node")
     async def enrich_node(state: ChatState) -> dict[str, object]:
-        db_context = ""
-        if state["scope"] == "broad" and state["search_query"] is not None:
-            db_context = await build_db_context(db, tenant_id, project_id)
+        with timing.step(ENRICH_RETRY if state.get("retried") else ENRICH):
+            db_context = ""
+            if state["scope"] == "broad" and state["search_query"] is not None:
+                db_context = await build_db_context(db, tenant_id, project_id)
 
-        filtered = _filter_bilan_thermique(state["search_results"], state["question"])
-        context_block, sources = _build_context_and_sources(
-            filtered,
-            score_threshold=state["score_threshold"],
-            context_max=state["context_max"],
-            max_sources=state["max_sources"],
-        )
-        if db_context:
-            context_block = (
-                f"{db_context}\n\n---\n\n{context_block}" if context_block else db_context
+            filtered = _filter_bilan_thermique(state["search_results"], state["question"])
+            context_block, sources = _build_context_and_sources(
+                filtered,
+                score_threshold=state["score_threshold"],
+                context_max=state["context_max"],
+                max_sources=state["max_sources"],
             )
+            if db_context:
+                context_block = (
+                    f"{db_context}\n\n---\n\n{context_block}" if context_block else db_context
+                )
 
-        mistral_messages = _build_mistral_messages(
-            context_block=context_block,
-            question=state["question"],
-            recent_messages=state["recent_messages"],
-            scope=state["scope"],
-            structured=state["structured"],
-            schema_flag=state["schema_flag"],
-            sources=sources,
-        )
-        if not context_block:
-            sources = []
+            mistral_messages = _build_mistral_messages(
+                context_block=context_block,
+                question=state["question"],
+                recent_messages=state["recent_messages"],
+                scope=state["scope"],
+                structured=state["structured"],
+                schema_flag=state["schema_flag"],
+                sources=sources,
+            )
+            if not context_block:
+                sources = []
 
-        return {
-            "context_block": context_block,
-            "sources": sources,
-            "mistral_messages": mistral_messages,
-        }
+            return {
+                "context_block": context_block,
+                "sources": sources,
+                "mistral_messages": mistral_messages,
+            }
 
     @traceable(name="generate_node")
     async def generate_node(state: ChatState) -> dict[str, object]:
-        writer = get_stream_writer()
-        full_response = ""
-        generation_usage: UsageInfo | None = None
+        with timing.step(GENERATE):
+            writer = get_stream_writer()
+            full_response = ""
+            generation_usage: UsageInfo | None = None
 
-        cache_key = prompt_cache_key(settings.retrieval_mode, "generation")
-        cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
-        await mistral_large_limiter.wait()
-        stream = await mistral_client.chat.stream_async(
-            model="mistral-large-latest",
-            messages=state["mistral_messages"],
-            temperature=0.1,
-            **cache_kwargs,
-        )
-        async for event in stream:
-            token = event.data.choices[0].delta.content
-            if token:
-                full_response += token
-                writer({"text": token})
-            if event.data.usage is not None:
-                generation_usage = event.data.usage
+            cache_key = prompt_cache_key(settings.retrieval_mode, "generation")
+            cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
+            await mistral_large_limiter.wait()
+            generation_started = time.perf_counter()
+            first_token_at: float | None = None
+            stream = await mistral_client.chat.stream_async(
+                model="mistral-large-latest",
+                messages=state["mistral_messages"],
+                temperature=0.1,
+                **cache_kwargs,
+            )
+            async for event in stream:
+                token = event.data.choices[0].delta.content
+                if token:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                        timing.record(
+                            GENERATE_FIRST_TOKEN, int((first_token_at - generation_started) * 1000)
+                        )
+                    full_response += token
+                    writer({"text": token})
+                if event.data.usage is not None:
+                    generation_usage = event.data.usage
 
-        return {"full_response": full_response, "generation_usage": generation_usage}
+            if first_token_at is not None:
+                timing.record(GENERATE_STREAM, _elapsed_ms(first_token_at))
+            return {"full_response": full_response, "generation_usage": generation_usage}
 
     @traceable(name="extract_table_node")
     async def extract_table_node(state: ChatState) -> dict[str, object]:
-        table = await extract_table(state["context_block"], state["question"])
-        return {"table": table}
+        with timing.step(EXTRACT_TABLE):
+            table_usage: list[tuple[str, UsageInfo]] = []
+            table = await extract_table(
+                state["context_block"], state["question"], usage_sink=table_usage
+            )
+            return {"table": table, "table_usage": table_usage}
 
     @traceable(name="extract_schema_node")
     async def extract_schema_node(state: ChatState) -> dict[str, object]:
-        schema = await extract_schema(state["context_block"], state["question"])
-        if schema and schema.schema_type == "semelle_filante":
-            missing = {"fond_fouille", "gros_beton", "bon_sol"} - set(schema.params)
-            if missing or "fond_fouille" in schema.params:
-                schema = await enrich_schema_with_search(
-                    schema, tenant_id=tenant_id, project_id=project_id
-                )
-        return {"schema_result": schema}
+        with timing.step(EXTRACT_SCHEMA):
+            schema_usage: list[tuple[str, UsageInfo]] = []
+            schema = await extract_schema(
+                state["context_block"], state["question"], usage_sink=schema_usage
+            )
+            if schema and schema.schema_type == "semelle_filante":
+                missing = {"fond_fouille", "gros_beton", "bon_sol"} - set(schema.params)
+                if missing or "fond_fouille" in schema.params:
+                    schema = await enrich_schema_with_search(
+                        schema, tenant_id=tenant_id, project_id=project_id
+                    )
+            return {"schema_result": schema, "schema_usage": schema_usage}
 
     @traceable(name="judge_node")
     async def judge_node(state: ChatState) -> dict[str, object]:
-        agent_usage = list(state.get("agent_usage") or [])
-        judgment = await judge_sufficiency(
-            state["question"], state["context_block"], usage_sink=agent_usage
-        )
-        retry_query: str | None = None
-        if should_retry(judgment, retried=state.get("retried", False)):
-            retry_query = await reformulate(
-                state["question"],
-                judgment.missing,
-                first_query=state["search_query"] or state["question"],
-                usage_sink=agent_usage,
+        with timing.step(JUDGE):
+            agent_usage = list(state.get("agent_usage") or [])
+            judgment = await judge_sufficiency(
+                state["question"], state["context_block"], usage_sink=agent_usage
             )
-        return {
-            "judgment_missing": None if judgment.sufficient else judgment.missing,
-            "retry_query": retry_query,
-            "agent_usage": agent_usage,
-        }
+            retry_query: str | None = None
+            if should_retry(judgment, retried=state.get("retried", False)):
+                retry_query = await reformulate(
+                    state["question"],
+                    judgment.missing,
+                    first_query=state["search_query"] or state["question"],
+                    usage_sink=agent_usage,
+                )
+            return {
+                "judgment_missing": None if judgment.sufficient else judgment.missing,
+                "retry_query": retry_query,
+                "agent_usage": agent_usage,
+            }
 
     @traceable(name="retry_search_node")
     async def retry_search_node(state: ChatState) -> dict[str, object]:
-        retry_query = state["retry_query"] or state["question"]
-        try:
-            second = await _run_search(
-                tenant_id=tenant_id,
-                project_id=project_id,
-                search_query=retry_query,
-                question=retry_query,
-                related_queries=[],
-                scope="specific",
-                search_limit=narrow_search_limit(settings.retrieval_mode, settings.v1_search_limit),
-            )
-        except Exception:
-            logger.exception("Retry search failed, serving the first search results")
-            return {"retried": True}
-        return {"search_results": merge_results(state["search_results"], second), "retried": True}
+        with timing.step(RETRY_SEARCH):
+            retry_query = state["retry_query"] or state["question"]
+            try:
+                second = await _run_search(
+                    tenant_id=tenant_id,
+                    project_id=project_id,
+                    search_query=retry_query,
+                    question=retry_query,
+                    related_queries=[],
+                    scope="specific",
+                    search_limit=narrow_search_limit(
+                        settings.retrieval_mode, settings.v1_search_limit
+                    ),
+                )
+            except Exception:
+                logger.exception("Retry search failed, serving the first search results")
+                return {"retried": True}
+            return {
+                "search_results": merge_results(state["search_results"], second),
+                "retried": True,
+            }
 
     async def error_node(state: ChatState) -> dict[str, object]:
         writer = get_stream_writer()
@@ -696,6 +747,8 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
                     "rewrite_usage": state.get("rewrite_usage"),
                     "generation_usage": state.get("generation_usage"),
                     "agent_usage": state.get("agent_usage"),
+                    "table_usage": state.get("table_usage"),
+                    "schema_usage": state.get("schema_usage"),
                 }
             }
         )
@@ -805,6 +858,7 @@ async def chat_stream(
     error_message: str | None = None
     ttft_ms: int | None = None
     completed = False
+    entries = timing.collect()
 
     try:
         async for chunk in graph.astream(initial_state, config, stream_mode="custom"):
@@ -853,6 +907,7 @@ async def chat_stream(
             started=started,
             ttft_ms=ttft_ms,
             failed=not completed,
+            entries=entries,
         )
 
 
@@ -861,10 +916,15 @@ def _elapsed_ms(started: float) -> int:
 
 
 def _question_usage(values: Mapping[str, object]) -> dict[str, object]:
-    """The {rewrite, generation, [agent,] total} usage of one question, priced per mode.
+    """The {rewrite, generation, [agent,] [extraction,] total} usage of one question, priced per mode.
 
     `values` is the `__final__` payload or the graph's final state: both carry the
-    `rewrite_usage` / `generation_usage` / `agent_usage` keys, possibly unset."""
+    `rewrite_usage` / `generation_usage` / `agent_usage` / `table_usage` / `schema_usage`
+    keys, possibly unset."""
+    extraction: list[tuple[str, UsageInfo]] = [
+        *(values.get("table_usage") or []),  # type: ignore[misc]
+        *(values.get("schema_usage") or []),  # type: ignore[misc]
+    ]
     agent_usage: list[UsageInfo] | None = None
     short_call_price: Price | None = None
     rewrite_price: Price | None = None
@@ -878,6 +938,7 @@ def _question_usage(values: Mapping[str, object]) -> dict[str, object]:
         agent_usage,
         short_call_price=short_call_price,
         rewrite_price=rewrite_price,
+        extraction=extraction,
     )
 
 
@@ -890,6 +951,7 @@ def _log_question(
     started: float,
     ttft_ms: int | None,
     failed: bool,
+    entries: list[tuple[str, int]],
 ) -> None:
     """Emit the one `chat_question` JSON record of this question; never raises.
 
@@ -906,6 +968,7 @@ def _log_question(
             latency_ms=_elapsed_ms(started),
             ttft_ms=ttft_ms,
             failed=failed,
+            timings=step_fields(entries),
         )
         question_logger.info(json.dumps(record))
     except Exception:

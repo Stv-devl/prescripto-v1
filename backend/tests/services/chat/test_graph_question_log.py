@@ -8,6 +8,7 @@ so a single substring check covers all of them.
 
 import logging
 import uuid
+from collections.abc import AsyncGenerator
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -154,3 +155,267 @@ async def test_a_failing_question_record_never_breaks_the_stream_and_logs_a_cons
     failures = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert [r.getMessage() for r in failures] == ["Question log record failed"]
     assert failures[0].args == ()
+
+
+@pytest.fixture
+def timing_v1(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-large-latest")
+
+
+async def _timed_question(
+    db: AsyncSession,
+    tenant: Tenant,
+    *,
+    question: str = "Quel type de béton pour les semelles ?",
+    structured: str = "none",
+    schema: str = "none",
+    tokens: tuple[str, ...] = ("Une réponse.",),
+    search_error: bool = False,
+    broad: bool = False,
+) -> dict[str, object]:
+    from tests.services.chat.question_log_capture import parsed, question_records
+    from tests.services.chat.test_graph import _raising_qdrant
+    from tests.services.chat.test_graph_agent_v1 import _patched_mistral as agent_mistral
+
+    project, user = await _project_and_user(db, tenant)
+    fake = (
+        _raising_qdrant("Search unavailable")
+        if search_error
+        else FakeQdrant([_chunk_point(tenant_id=tenant.id, project_id=project.id, text=CONTEXT_TEXT)])
+    )
+    rewrite = _rewrite_response(query=question, structured=structured, schema=schema)
+    mistral = (
+        agent_mistral(rewrite_response=rewrite)
+        if broad
+        else _patched_mistral(rewrite_response=rewrite, stream_tokens=tokens)
+    )
+    with question_records() as records, _patched_qdrant(fake), mistral:
+        await _stream(
+            db, tenant_id=tenant.id, project_id=project.id, user_id=user.id, question=question
+        )
+    lines = parsed(records)
+    assert len(lines) == 1
+    return lines[0]
+
+
+def _assert_durations(record: dict[str, object], keys: tuple[str, ...]) -> None:
+    for key in keys:
+        value = record[key]
+        assert isinstance(value, int) and value >= 0
+
+
+async def test_narrow_question_record_carries_the_narrow_steps(
+    db: AsyncSession, tenant_a: Tenant, timing_v1: None
+) -> None:
+    record = await _timed_question(db, tenant_a)
+    _assert_durations(record, (
+        "rewrite_ms", "rewrite_wait_ms", "search_ms", "enrich_ms", "generate_ms",
+        "generate_wait_ms", "generate_first_token_ms", "generate_stream_ms",
+    ))
+    assert "judge_ms" not in record
+    assert "retry_search_ms" not in record
+
+
+async def test_a_real_limiter_wait_reaches_the_emitted_line(
+    db: AsyncSession, tenant_a: Tenant, timing_v1: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.core import mistral
+
+    now = time.monotonic()
+    monkeypatch.setattr(mistral, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(mistral.mistral_large_limiter, "_min_interval", 4.0)
+    monkeypatch.setattr(mistral.mistral_large_limiter, "_next_slot", now + 3.0)
+    monkeypatch.setattr(mistral, "asyncio", SimpleNamespace(sleep=AsyncMock()))
+    record = await _timed_question(db, tenant_a)
+    assert record["rewrite_wait_ms"] >= 2900
+
+
+async def test_first_token_ignores_an_empty_role_chunk(
+    db: AsyncSession, tenant_a: Tenant, timing_v1: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from app.core.mistral import mistral_client
+    from app.services.chat import graph
+
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant([_chunk_point(tenant_id=tenant_a.id, project_id=project.id, text=CONTEXT_TEXT)])
+    now = {"value": 1.0}
+    monkeypatch.setattr(graph, "time", SimpleNamespace(perf_counter=lambda: now["value"]))
+
+    async def stream_async(**kwargs: object) -> object:
+        async def chunks() -> AsyncGenerator[SimpleNamespace, None]:
+            for instant, token in ((1.1, ""), (2.5, "token")):
+                now["value"] = instant
+                yield SimpleNamespace(data=SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content=token))], usage=None
+                ))
+            now["value"] = 3.0
+        return chunks()
+
+    from tests.services.chat.question_log_capture import parsed, question_records
+
+    with (
+        question_records() as records,
+        _patched_qdrant(fake),
+        _patched_mistral(rewrite_response=_rewrite_response(query="Quel béton ?")),
+        patch.object(mistral_client.chat, "stream_async", side_effect=stream_async),
+    ):
+        await _stream(db, tenant_id=tenant_a.id, project_id=project.id, user_id=user.id, question="Quel béton ?")
+    record = parsed(records)[0]
+    assert record["generate_first_token_ms"] == 1500
+    assert record["generate_stream_ms"] == 500
+
+
+async def test_broad_retried_question_record_carries_judge_and_retry_steps(
+    db: AsyncSession, tenant_a: Tenant, timing_v1: None
+) -> None:
+    record = await _timed_question(db, tenant_a, question="Listez les lots du projet ?", broad=True)
+    _assert_durations(record, (
+        "judge_ms", "judge_wait_ms", "retry_search_ms", "enrich_ms", "enrich_retry_ms",
+    ))
+    assert record["retried"] is True
+
+
+async def test_table_question_record_carries_parallel_generation_and_extraction(
+    db: AsyncSession, tenant_a: Tenant, timing_v1: None
+) -> None:
+    record = await _timed_question(db, tenant_a, structured="table")
+    _assert_durations(record, ("generate_ms", "extract_table_ms", "extract_table_wait_ms"))
+
+
+async def test_schema_question_record_carries_extract_schema(
+    db: AsyncSession, tenant_a: Tenant, timing_v1: None
+) -> None:
+    record = await _timed_question(db, tenant_a, schema="schema")
+    _assert_durations(record, ("extract_schema_ms", "extract_schema_wait_ms"))
+
+
+async def test_search_error_record_still_carries_the_steps_that_ran(
+    db: AsyncSession, tenant_a: Tenant, timing_v1: None
+) -> None:
+    record = await _timed_question(db, tenant_a, search_error=True)
+    _assert_durations(record, ("rewrite_ms", "search_ms"))
+    assert "generate_ms" not in record
+    assert record["outcome"] == "search_error"
+
+
+async def test_step_timings_add_no_text_to_the_record(
+    db: AsyncSession, tenant_a: Tenant, timing_v1: None
+) -> None:
+    import json
+
+    record = await _timed_question(db, tenant_a, question="Quel béton ZXQQUESTION ?", tokens=("ZXQANSWER",))
+    assert "generate_ms" in record
+    assert "ZXQ" not in json.dumps(record)
+
+
+async def test_no_token_records_no_generation_submeasures(
+    db: AsyncSession, tenant_a: Tenant, timing_v1: None
+) -> None:
+    record = await _timed_question(db, tenant_a, tokens=("",))
+    assert "generate_ms" in record
+    assert "generate_first_token_ms" not in record
+    assert "generate_stream_ms" not in record
+
+
+async def _extraction_question(
+    db: AsyncSession,
+    tenant: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    structured: str = "table",
+    schema: str = "none",
+) -> tuple[dict[str, object], list[dict[str, object] | str]]:
+    from mistralai.client.models import UsageInfo
+
+    from tests.services.chat.question_log_capture import parsed, question_records
+
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    monkeypatch.setattr("app.core.config.settings.v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.core.config.settings.v1_rewrite_model", "mistral-large-latest")
+    project, user = await _project_and_user(db, tenant)
+    question = "Quel type de béton pour les semelles ?"
+    fake = FakeQdrant([_chunk_point(tenant_id=tenant.id, project_id=project.id, text=CONTEXT_TEXT)])
+    table_response = _table_response(
+        title="Semelles",
+        rows=[{"element": "Semelle", "description": "C25/30", "quantite": "", "localisation": ""}],
+    )
+    table_response.usage = UsageInfo(prompt_tokens=1000, completion_tokens=200, total_tokens=1200)
+    with (
+        question_records() as records,
+        _patched_qdrant(fake),
+        _patched_mistral(
+            rewrite_response=_rewrite_response(
+                query=question, structured=structured, schema=schema
+            ),
+            table_response=table_response,
+        ),
+    ):
+        events = await _stream(
+            db, tenant_id=tenant.id, project_id=project.id, user_id=user.id, question=question
+        )
+    lines = parsed(records)
+    assert len(lines) == 1
+    return lines[0], events
+
+
+async def test_table_question_record_carries_an_extraction_leg_priced_large_in_v1(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record, _ = await _extraction_question(db, tenant_a, monkeypatch)
+
+    legs = record["legs"]
+    assert legs["extraction"] == {  # type: ignore[index]
+        "input_tokens": 1000,
+        "cached_tokens": 0,
+        "output_tokens": 200,
+        "cost_usd": pytest.approx(0.0008),
+    }
+    assert record["cost_usd"] == pytest.approx(
+        sum(leg["cost_usd"] for leg in legs.values())  # type: ignore[union-attr]
+    )
+
+
+async def test_question_without_extraction_has_no_extraction_leg(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record, _ = await _extraction_question(db, tenant_a, monkeypatch, structured="none")
+
+    assert "extraction" not in record["legs"]  # type: ignore[operator]
+
+
+async def test_table_question_usage_event_carries_the_extraction_leg(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record, events = await _extraction_question(db, tenant_a, monkeypatch)
+
+    usage_events = [e for e in events if isinstance(e, dict) and "usage" in e]
+    assert len(usage_events) == 1
+    assert usage_events[0]["usage"]["extraction"] == record["legs"]["extraction"]  # type: ignore[index]
+
+
+async def test_v1_table_and_schema_question_waits_on_the_large_limiter_for_every_call(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from app.core.mistral import mistral_fast_limiter, mistral_large_limiter
+
+    with (
+        patch.object(mistral_large_limiter, "wait", new_callable=AsyncMock) as large_wait,
+        patch.object(mistral_fast_limiter, "wait", new_callable=AsyncMock) as fast_wait,
+    ):
+        record, _ = await _extraction_question(
+            db, tenant_a, monkeypatch, structured="table", schema="schema"
+        )
+
+    assert record["judged"] is False
+    assert large_wait.await_count == 4
+    assert fast_wait.await_count == 0
