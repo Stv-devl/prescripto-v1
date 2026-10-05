@@ -102,3 +102,15 @@ jobs:
       # Scoped to app/: tests/services is the frozen half (07-backend.md).
       - name: Format
         run: uv run --frozen ruff format --check app/
+
+      # The eval gate's verdict (scripts/eval_gate.py) runs on the self-hosted runner and in its
+      # job-started hook with a bare python3: tested here, and checked importable with the stdlib
+      # only. setup-uv does not activate the venv, so python3 below is the image's interpreter.
+      - name: Eval gate tests
+        run: uv run --frozen python -m pytest ../scripts/tests -o addopts="" -p no:cacheprovider
+
+      - name: Eval gate lint
+        run: uv run --frozen ruff check ../scripts
+
+      - name: Eval gate stdlib only
+        run: python3 -I ../scripts/eval_gate.py selfcheck

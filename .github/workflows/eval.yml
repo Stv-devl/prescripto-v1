@@ -1,0 +1,76 @@
+# Retrieval-recall gate (J4). The measurement needs the private corpus, so it runs on the
+# owner's self-hosted runner. The public repo makes that runner reachable by PR code: the real
+# barrier against forks is the runner's job-started hook (outside this file, which a fork
+# controls) plus never approving fork runs. The `guard` job below is defence in depth only.
+# Everything printed here is public: only scripts/eval_gate.py writes to the log and summary.
+name: Eval
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      # No checkout: nothing from the pull request runs here.
+      - name: Refuse pull requests from forks
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then exit 0; fi
+          if [ "$EVENT" = "pull_request" ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" = "$REPO" ]; then
+            exit 0
+          fi
+          echo "eval gate: refused (pull request from a fork)"
+          exit 1
+
+  eval:
+    needs: guard
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, prescripto-eval]
+    timeout-minutes: 20
+    steps:
+      # Pinned to the commit of tag v4: this action runs on the self-hosted host, next to the
+      # runner's environment, so a moved tag must not change what executes here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Measurement output (uv, harness, warnings) goes to a local run folder, never to the log.
+      # stderr is closed first so a failing mkdir or redirection cannot print a local path, and
+      # the run folder path is never exported (GITHUB_ENV values are echoed in step headers).
+      - name: Measure retrieval recall
+        run: |
+          exec 2>/dev/null
+          umask 077
+          run_dir="$PRESCRIPTO_EVAL_DIR/result/ci-runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          status=0
+          mkdir -p "$run_dir" || status=1
+          if [ "$status" -eq 0 ]; then
+            (cd backend && uv sync --frozen) > "$run_dir/uv-sync.log" 2>&1 || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            (cd backend && RETRIEVAL_MODE=v1 PYTHONPATH=".:$PRESCRIPTO_EVAL_DIR" \
+              uv run --frozen python "$PRESCRIPTO_EVAL_DIR/ci_recall.py" "$run_dir/measure.json") \
+              > "$run_dir/measure.log" 2>&1 || status=$?
+          fi
+          echo "measurement exit $status"
+
+      - name: Compare to the reference
+        run: |
+          python3 scripts/eval_gate.py check \
+            --measure "$PRESCRIPTO_EVAL_DIR/result/ci-runs/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/measure.json" \
+            --reference "$PRESCRIPTO_EVAL_DIR/result/ci-reference.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
