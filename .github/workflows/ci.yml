@@ -1,0 +1,104 @@
+# Server-side copy of the /loop:ship gates (.claude/skills/templates/ci.md).
+# Deterministic steps only: no model, no network service, no secret.
+# The blocking RAG eval runs elsewhere (self-hosted runner, J4).
+name: CI
+
+on:
+  push:
+    branches: [main, sprint]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm is not preinstalled on the ubuntu images. Same major as the lockfile.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm --filter client exec tsc --noEmit
+
+      - name: Lint
+        run: pnpm --filter client exec eslint src e2e --max-warnings=0
+
+      # Kept apart from the coverage step: the run-once role must not depend on
+      # the coverage provider.
+      - name: Test
+        run: pnpm --filter client exec vitest run
+
+      # Thresholds live in client/vitest.config.ts, not here.
+      - name: Coverage floor
+        run: pnpm --filter client test:coverage
+
+      - name: Build
+        run: pnpm build
+
+      # A red with no published fix goes to pnpm.auditConfig.ignoreCves with a
+      # reason, never to a lower --audit-level.
+      - name: Dependency audit
+        run: pnpm audit --audit-level=high
+
+      # Same grep as /loop:ship: any VITE_* secret-looking name ships in the bundle.
+      - name: Bundle secrets
+        working-directory: client
+        run: |
+          test -d src/ || { echo "SCAN NOT RUN: no src/"; exit 1; }
+          if grep -rnE 'VITE_[A-Z0-9_]*(SECRET|PRIVATE|SERVICE_ROLE|PASSWORD|TOKEN|_KEY)' \
+               src/ $( [ -f .env.example ] && echo .env.example ) \
+             | grep -vE '(ANON|PUBLIC|PUBLISHABLE)_KEY'; then
+            echo "Secret-looking VITE_ variable found above"
+            exit 1
+          fi
+
+  # Two roles have no tool yet and are reported missing, not invented:
+  # typecheck (mypy/pyright) and dependency audit (pip-audit).
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install
+        run: uv sync --extra dev --frozen
+
+      # tests/conftest.py provides placeholder settings; nothing reaches
+      # Postgres, Qdrant or Mistral. Coverage floor comes from pyproject addopts.
+      - name: Test
+        run: uv run --frozen python -m pytest
+
+      - name: Lint
+        run: uv run --frozen ruff check .
+
+      # Scoped to app/: tests/services is the frozen half (07-backend.md).
+      - name: Format
+        run: uv run --frozen ruff format --check app/
