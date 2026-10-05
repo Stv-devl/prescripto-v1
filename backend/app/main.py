@@ -6,7 +6,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.routing import Route
 
+from app.api.mcp import build_http_mcp, mcp_asgi_app
 from app.api.router import router
 from app.core.config import DEV_SEED_EMAIL, email_delivery_warning, settings
 from app.core.database import engine
@@ -16,6 +18,7 @@ from app.core.log_config import configure_question_logger
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("app").setLevel(logging.DEBUG if settings.dev_mode else logging.INFO)
 configure_question_logger()
+mcp_http = build_http_mcp()
 
 
 async def _seed_dev_data() -> None:
@@ -72,17 +75,18 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         "Rate-limit client key trusts proxies: %s",
         settings.forwarded_allow_ips or "(unset — socket address only)",
     )
-    async with engine.connect() as conn:
-        await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
-    if settings.dev_mode:
-        await _seed_dev_data()
-    from app.core.database import async_session
-    from app.services.auth import reconcile_admin_roles
+    async with mcp_http.session_manager.run():
+        async with engine.connect() as conn:
+            await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+        if settings.dev_mode:
+            await _seed_dev_data()
+        from app.core.database import async_session
+        from app.services.auth import reconcile_admin_roles
 
-    async with async_session() as session:
-        await reconcile_admin_roles(session)
-    yield
-    await engine.dispose()
+        async with async_session() as session:
+            await reconcile_admin_roles(session)
+        yield
+        await engine.dispose()
 
 
 app = FastAPI(
@@ -102,6 +106,9 @@ app.add_middleware(
 
 register_exception_handlers(app)
 app.include_router(router)
+mcp_transport = mcp_asgi_app(mcp_http)
+app.router.routes.append(Route("/mcp", endpoint=mcp_transport))
+app.mount("/mcp", mcp_transport)
 
 
 @app.get("/api/health")

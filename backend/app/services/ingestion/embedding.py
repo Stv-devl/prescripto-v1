@@ -18,6 +18,7 @@ from app.core.config import settings
 from app.core.mistral import mistral_client
 from app.core.qdrant import qdrant_client
 from app.services.ingestion.chunking import TextChunk
+from app.services.ingestion.injection_marking import mark_suspect_points
 from app.services.qdrant_payload import ChunkPayloadFields, build_chunk_payload
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,11 @@ async def index_chunks(
             )
 
         await qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
+        await mark_suspect_points(
+            [chunk.text for chunk in batch],
+            [str(point.id) for point in points],
+            collection=COLLECTION_NAME,
+        )
 
     return point_ids
 

@@ -47,6 +47,7 @@ from app.services.chat.query_rewrite import rewrite_query
 from app.services.chat.schema_extraction import enrich_schema_with_search, extract_schema
 from app.services.chat.search_limits import narrow_search_limit, query_limits
 from app.services.chat.table_extraction import extract_table
+from app.services.injection_guard import DATA_FRAMING_RULE, frame_context
 
 logger = logging.getLogger(__name__)
 
@@ -669,13 +670,18 @@ def _build_mistral_messages(
             "mentionné dans ta réponse textuelle."
         )
 
+    framed = settings.retrieval_mode == "v1"
+    if framed:
+        system_content += "\n\n" + DATA_FRAMING_RULE
+
     mistral_messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]
 
     for msg in recent_messages[:-1]:
         mistral_messages.append({"role": msg.role, "content": msg.content})
 
+    rendered_context = frame_context(context_block) if framed else context_block
     user_turn = (
-        f"Contexte extrait des documents :\n\n{context_block}\n\n---\n\nQuestion : {question}"
+        f"Contexte extrait des documents :\n\n{rendered_context}\n\n---\n\nQuestion : {question}"
         if context_block
         else (
             "Aucun document pertinent n'a été trouvé dans le projet pour cette question. "

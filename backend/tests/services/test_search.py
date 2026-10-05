@@ -364,3 +364,49 @@ class TestTheDiversityGuaranteeOnTheFallbackPath:
             )
 
         assert "b-best" in [r.text for r in results]
+
+
+class TestResultsCarryTheQdrantPointId:
+    """The MCP tool surface hands back the id of the Qdrant point a passage came from,
+    so `read_passage` can retrieve it by that id.
+    """
+
+    async def test_search_merged_results_carry_the_qdrant_point_id(self) -> None:
+        tenant, project = uuid.uuid4(), uuid.uuid4()
+        point = _chunk("passage", tenant_id=tenant, project_id=project)
+        point.id = "7d3e9a52-4b1c-4f6e-8a21-5c0d9e3b7f14"
+        store = FakeQdrant([point])
+        embed = AsyncMock(return_value=[[0.1] * 8])
+
+        with (
+            patch("app.services.search.qdrant_client", store),
+            patch("app.services.search.embed_texts", embed),
+        ):
+            results = await search_merged(
+                tenant_id=tenant,
+                project_id=project,
+                queries=["béton"],
+                filters=SearchFilters(),
+            )
+
+        assert [r.point_id for r in results] == ["7d3e9a52-4b1c-4f6e-8a21-5c0d9e3b7f14"]
+
+    async def test_search_documents_results_carry_the_qdrant_point_id(self) -> None:
+        tenant, project = uuid.uuid4(), uuid.uuid4()
+        point = _chunk("passage", tenant_id=tenant, project_id=project)
+        point.id = "7d3e9a52-4b1c-4f6e-8a21-5c0d9e3b7f14"
+        store = FakeQdrant([point])
+        embed = AsyncMock(return_value=[[0.1] * 8])
+
+        with (
+            patch("app.services.search.qdrant_client", store),
+            patch("app.services.search.embed_texts", embed),
+        ):
+            results = await search_documents(
+                tenant_id=tenant,
+                project_id=project,
+                query="béton",
+                filters=SearchFilters(),
+            )
+
+        assert [r.point_id for r in results] == ["7d3e9a52-4b1c-4f6e-8a21-5c0d9e3b7f14"]

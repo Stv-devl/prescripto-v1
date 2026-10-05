@@ -599,3 +599,37 @@ class TestStreamNarrowSearchLimit:
     ) -> None:
         """Under baseline the legacy narrow-scope search keeps 20 whatever is configured."""
         assert await self._recorded_limit(db, tenant_a, monkeypatch, "baseline") == [20]
+
+
+def test_v1_stream_user_turn_frames_the_context(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """A missing v1 user-turn frame would expose raw document instructions."""
+    from app.services.chat.stream import _build_mistral_messages
+
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "v1")
+    messages = _build_mistral_messages(
+        context_block="[a.pdf, p.1]\nDoublage.",
+        question="Quel doublage ?",
+        recent_messages=[],
+        scope="specific",
+        structured="none",
+        schema_flag="none",
+        sources=[],
+    )
+    assert "<documents>\n[a.pdf, p.1]\nDoublage.\n</documents>" in messages[-1]["content"]
+
+
+def test_baseline_stream_user_turn_is_not_framed(monkeypatch: "pytest.MonkeyPatch") -> None:
+    """Applying v1 framing to baseline would change its reference prompt."""
+    from app.services.chat.stream import _build_mistral_messages
+
+    monkeypatch.setattr("app.core.config.settings.retrieval_mode", "baseline")
+    messages = _build_mistral_messages(
+        context_block="[a.pdf, p.1]\nDoublage.",
+        question="Quel doublage ?",
+        recent_messages=[],
+        scope="specific",
+        structured="none",
+        schema_flag="none",
+        sources=[],
+    )
+    assert "<documents>" not in messages[-1]["content"]

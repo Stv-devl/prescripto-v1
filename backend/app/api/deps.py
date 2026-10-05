@@ -20,6 +20,8 @@ from app.core.auth import decode_token
 from app.core.config import settings
 from app.core.database import async_session
 from app.core.exceptions import RateLimitError, UnauthorizedError
+from app.services.mcp_server import SessionFactory
+from app.services.mcp_tools import ToolIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,24 @@ async def get_current_user(
     tenant_id = uuid.UUID(payload["tenant_id"])
     await verify_access_token_version(db, user_id, tenant_id, payload.get("token_version"))
     return {"user_id": user_id, "tenant_id": tenant_id}
+
+
+async def resolve_bearer_identity(
+    token: str, session_factory: SessionFactory = async_session
+) -> ToolIdentity:
+    from app.services.auth import verify_access_token_version
+
+    payload = decode_token(token)
+    if payload.get("type") != "access":
+        raise UnauthorizedError("Invalid token type")
+    try:
+        user_id = uuid.UUID(str(payload["user_id"]))
+        tenant_id = uuid.UUID(str(payload["tenant_id"]))
+    except (ValueError, KeyError) as exc:
+        raise UnauthorizedError("Invalid token payload") from exc
+    async with session_factory() as db:
+        await verify_access_token_version(db, user_id, tenant_id, payload.get("token_version"))
+    return ToolIdentity(tenant_id=tenant_id)
 
 
 async def get_current_tenant(
