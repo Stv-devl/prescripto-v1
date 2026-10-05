@@ -234,6 +234,7 @@ async def search_documents(
             score *= 0.80
         results.append(
             SearchResult(
+                point_id=str(hit.id),
                 text=payload.get("text", ""),
                 page=payload.get("page", 0),
                 position=payload.get("position", 0),
@@ -641,6 +642,7 @@ async def search_merged(
             score *= 0.80
         results.append(
             SearchResult(
+                point_id=str(hit.id),
                 text=payload.get("text", ""),
                 page=payload.get("page", 0),
                 position=payload.get("position", 0),

@@ -1,13 +1,56 @@
 """Unit tests for the `get_current_user` FastAPI dependency."""
 
 import uuid
+from contextlib import nullcontext
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.security import HTTPAuthorizationCredentials
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, resolve_bearer_identity
+from app.core.auth import create_access_token, create_refresh_token
+from app.core.config import settings
 from app.core.exceptions import RateLimitError, UnauthorizedError
+from app.models.tenant import Tenant
+from app.models.user import User
+
+
+async def test_resolve_bearer_identity_returns_the_tenant_of_a_valid_access_token(
+    db: AsyncSession, tenant_a: Tenant,
+) -> None:
+    user = User(tenant_id=tenant_a.id, email="mcp@example.test", hashed_password="unused")
+    db.add(user)
+    await db.commit()
+    token = create_access_token(user.id, tenant_a.id, 0)
+    identity = await resolve_bearer_identity(token, lambda: nullcontext(db))
+    assert identity.tenant_id == tenant_a.id
+    assert identity.allowed_project_id is None
+
+
+async def test_resolve_bearer_identity_rejects_a_refresh_token() -> None:
+    token = create_refresh_token(uuid.uuid4(), uuid.uuid4(), 0)
+    with pytest.raises(UnauthorizedError):
+        await resolve_bearer_identity(token, lambda: nullcontext(_exploding_db()))
+
+
+async def test_resolve_bearer_identity_rejects_a_revoked_token(
+    db: AsyncSession, tenant_a: Tenant,
+) -> None:
+    user = User(tenant_id=tenant_a.id, email="mcp@example.test", hashed_password="unused")
+    db.add(user)
+    await db.commit()
+    token = create_access_token(user.id, tenant_a.id, 0)
+    user.token_version = 1
+    await db.commit()
+    with pytest.raises(UnauthorizedError):
+        await resolve_bearer_identity(token, lambda: nullcontext(db))
+
+
+async def test_resolve_bearer_identity_has_no_dev_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "environment", "local")
+    with pytest.raises(UnauthorizedError):
+        await resolve_bearer_identity("", lambda: nullcontext(_exploding_db()))
 
 
 def _exploding_db() -> AsyncMock:

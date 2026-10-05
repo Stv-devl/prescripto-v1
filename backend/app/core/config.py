@@ -137,6 +137,18 @@ class Settings(BaseSettings):
     )
     rate_limit_reset_window_seconds: int = 900
 
+    mcp_allowed_hosts: str = Field(
+        default="localhost:*,127.0.0.1:*",
+        description=(
+            "Comma-separated Host values the /mcp transport accepts (DNS-rebinding "
+            "protection, exact or 'host:*'). The SDK default only lets localhost "
+            "through, so a deployed instance must list its public API host."
+        ),
+    )
+    mcp_rate_limit_per_minute: int = Field(
+        default=60, description="Per-tenant /mcp request budget (core/ratelimit.py)."
+    )
+
     forwarded_allow_ips: str = Field(
         default="",
         description=(

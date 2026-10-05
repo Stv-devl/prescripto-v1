@@ -419,3 +419,39 @@ async def test_v1_table_and_schema_question_waits_on_the_large_limiter_for_every
     assert record["judged"] is False
     assert large_wait.await_count == 4
     assert fast_wait.await_count == 0
+
+
+async def test_broad_tool_retry_record_carries_judge_and_retry_steps(
+    db: AsyncSession, tenant_a: Tenant, timing_v1: None
+) -> None:
+    import json
+
+    from app.core.mistral import mistral_client
+    from tests.services.chat.question_log_capture import parsed, question_records
+    from tests.services.chat.test_graph_agent_v1 import (
+        BROAD_QUESTION,
+        REFORMULATED,
+        _points,
+    )
+    from tests.services.chat.test_graph_agent_v1 import _patched_mistral as agent_mistral
+
+    project, user = await _project_and_user(db, tenant_a)
+    fake = FakeQdrant(_points(tenant_a.id, project.id))
+    with question_records() as records, _patched_qdrant(fake), agent_mistral(
+        rewrite_response=_rewrite_response(query=BROAD_QUESTION)
+    ):
+        await _stream(
+            db, tenant_id=tenant_a.id, project_id=project.id, user_id=user.id, question=BROAD_QUESTION
+        )
+        tool_turns = [
+            call for call in mistral_client.chat.complete_async.call_args_list if "tools" in call.kwargs
+        ]
+
+    assert len(tool_turns) == 1
+    record = parsed(records)[0]
+    _assert_durations(record, (
+        "judge_ms", "judge_wait_ms", "retry_search_ms", "enrich_ms", "enrich_retry_ms",
+    ))
+    assert record["retried"] is True
+    assert "retry_query" not in record
+    assert REFORMULATED not in json.dumps(record)

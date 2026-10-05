@@ -35,6 +35,14 @@ class SearchResult(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     localisation: list[str] = Field(default_factory=list)
     char_count: int = 0
+    point_id: str | None = None
+
+
+class ToolPassage(SearchResult):
+    """A search result served by an MCP tool: always traceable to its Qdrant point."""
+
+    point_id: str
+    suspect: bool
 
 
 class SearchResponse(BaseModel):

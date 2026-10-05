@@ -14,6 +14,9 @@ import re
 import time
 import uuid
 from collections.abc import AsyncGenerator, Mapping
+from contextlib import nullcontext
+from contextvars import ContextVar
+from functools import cache
 from types import SimpleNamespace
 from typing import TypedDict
 
@@ -21,6 +24,8 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langsmith import traceable
+from mcp.server.fastmcp import FastMCP
+from mcp.shared.memory import create_connected_server_and_client_session
 from mistralai.client.models import UsageInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -86,16 +91,34 @@ from app.services.chat.step_timing import (
 from app.services.chat.sufficiency import (
     judge_sufficiency,
     merge_results,
-    reformulate,
     should_judge,
     should_retry,
 )
 from app.services.chat.table_extraction import extract_table
+from app.services.chat.tool_retry import RetryOutcome, retry_with_tools
+from app.services.injection_guard import DATA_FRAMING_RULE, frame_context
+from app.services.mcp_server import lowlevel_server, register_tools
+from app.services.mcp_tools import ToolIdentity, identity_scope
 
 configure_langsmith(settings)
 
 logger = logging.getLogger(__name__)
 question_logger = logging.getLogger(QUESTION_LOGGER)
+
+_request_db: ContextVar[AsyncSession] = ContextVar("mcp_request_db")
+
+
+def _request_session() -> nullcontext[AsyncSession]:
+    return nullcontext(_request_db.get())
+
+
+@cache
+def _internal_server() -> FastMCP:
+    """Built on first use, never at import: FastMCP's constructor configures root logging."""
+    server = FastMCP("prescripto-internal")
+    register_tools(server, _request_session)
+    return server
+
 
 SEARCH_ERROR_MESSAGE = (
     "Le service de recherche est temporairement indisponible. "
@@ -454,13 +477,18 @@ def _build_mistral_messages(
             "mentionné dans ta réponse textuelle."
         )
 
+    framed = settings.retrieval_mode == "v1"
+    if framed:
+        system_content += "\n\n" + DATA_FRAMING_RULE
+
     mistral_messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]
 
     for msg in recent_messages[:-1]:
         mistral_messages.append({"role": msg["role"], "content": msg["content"]})
 
+    rendered_context = frame_context(context_block) if framed else context_block
     user_turn = (
-        f"Contexte extrait des documents :\n\n{context_block}\n\n---\n\nQuestion : {question}"
+        f"Contexte extrait des documents :\n\n{rendered_context}\n\n---\n\nQuestion : {question}"
         if context_block
         else (
             "Aucun document pertinent n'a été trouvé dans le projet pour cette question. "
@@ -501,6 +529,7 @@ class ChatState(TypedDict, total=False):
     error: str | None
     judgment_missing: str | None
     retry_query: str | None
+    needs_retry: bool
     retried: bool
     agent_usage: list[UsageInfo]
     table_usage: list[tuple[str, UsageInfo]]
@@ -679,42 +708,47 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
             judgment = await judge_sufficiency(
                 state["question"], state["context_block"], usage_sink=agent_usage
             )
-            retry_query: str | None = None
-            if should_retry(judgment, retried=state.get("retried", False)):
-                retry_query = await reformulate(
-                    state["question"],
-                    judgment.missing,
-                    first_query=state["search_query"] or state["question"],
-                    usage_sink=agent_usage,
-                )
             return {
                 "judgment_missing": None if judgment.sufficient else judgment.missing,
-                "retry_query": retry_query,
+                "needs_retry": should_retry(judgment, retried=state.get("retried", False)),
                 "agent_usage": agent_usage,
             }
+
+    async def _retry_through_mcp(
+        question: str, missing: str, agent_usage: list[UsageInfo]
+    ) -> RetryOutcome:
+        identity = ToolIdentity(tenant_id=tenant_id, allowed_project_id=project_id)
+        token = _request_db.set(db)
+        try:
+            with identity_scope(identity):
+                async with create_connected_server_and_client_session(
+                    lowlevel_server(_internal_server())
+                ) as session:
+                    return await retry_with_tools(
+                        question,
+                        missing,
+                        project_id=project_id,
+                        session=session,
+                        usage_sink=agent_usage,
+                    )
+        finally:
+            _request_db.reset(token)
 
     @traceable(name="retry_search_node")
     async def retry_search_node(state: ChatState) -> dict[str, object]:
         with timing.step(RETRY_SEARCH):
-            retry_query = state["retry_query"] or state["question"]
+            agent_usage = list(state.get("agent_usage") or [])
+            missing = state.get("judgment_missing") or state["question"]
             try:
-                second = await _run_search(
-                    tenant_id=tenant_id,
-                    project_id=project_id,
-                    search_query=retry_query,
-                    question=retry_query,
-                    related_queries=[],
-                    scope="specific",
-                    search_limit=narrow_search_limit(
-                        settings.retrieval_mode, settings.v1_search_limit
-                    ),
-                )
+                outcome = await _retry_through_mcp(state["question"], missing, agent_usage)
             except Exception:
-                logger.exception("Retry search failed, serving the first search results")
-                return {"retried": True}
+                logger.exception("Tool retry failed, serving the first search results")
+                return {"retried": True, "agent_usage": agent_usage}
             return {
-                "search_results": merge_results(state["search_results"], second),
+                "search_results": merge_results(state["search_results"], outcome.results),
+                "retry_query": " ; ".join(outcome.queries) or None,
                 "retried": True,
+                "agent_usage": agent_usage,
             }
 
     async def error_node(state: ChatState) -> dict[str, object]:
@@ -775,7 +809,7 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
         return ["judge_node"] if needs_judge else _generation_targets(state)
 
     def _route_after_judge(state: ChatState) -> list[str]:
-        return ["retry_search_node"] if state.get("retry_query") else _generation_targets(state)
+        return ["retry_search_node"] if state.get("needs_retry") else _generation_targets(state)
 
     generation_targets = ["generate_node", "extract_table_node", "extract_schema_node"]
 
