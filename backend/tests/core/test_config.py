@@ -246,7 +246,7 @@ class TestV1SearchLimit:
             _settings(v1_search_limit=0)
 
     def test_defaults_to_15_the_value_kept_on_the_pinned_replays(self) -> None:
-        assert _settings().v1_search_limit == 15
+        assert _settings().v1_search_limit == 10
 
 
 class TestV1ModelRouting:

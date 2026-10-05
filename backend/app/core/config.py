@@ -56,7 +56,7 @@ class Settings(BaseSettings):
         ),
     )
     v1_search_limit: int = Field(
-        default=15,
+        default=10,
         ge=1,
         description=(
             "Narrow-scope chat search limit under RETRIEVAL_MODE=v1; the per-query floor "
