@@ -755,3 +755,83 @@ class TestRepairingPayloadsWrittenBeforeTheUnifiedBuilder:
 
         assert result.repaired_count == 0
         assert store.points[0].payload["text"] == "tel quel"
+
+
+class TestMutationVectorShapeInV1:
+    """In v1 the collection holds named `dense` + `sparse` vectors.
+
+    A mutation that upserts a bare list into it either is rejected or leaves the
+    passage out of retrieval, so each writer must produce the shape `index_chunks`
+    produces.
+    """
+
+    @staticmethod
+    def _assert_named_vectors(vector: object, dense: list[float]) -> None:
+        from qdrant_client.models import SparseVector
+
+        assert isinstance(vector, dict)
+        assert set(vector.keys()) == {"dense", "sparse"}
+        assert vector["dense"] == dense
+        assert isinstance(vector["sparse"], SparseVector)
+        assert len(vector["sparse"].indices) > 0
+
+    async def test_update_chunk_writes_a_named_dense_and_sparse_vector_in_v1(
+        self, db: AsyncSession, tenant_a: Tenant
+    ) -> None:
+        project = await _project_of(db, tenant_a)
+        document = await _document_of(db, project, "cctp.pdf", type="CCTP", lot="LOT 01")
+        chunk = await _chunk_of(db, document, "texte d'origine", qdrant_point_id="p-1")
+        store = FakeQdrant()
+        embed = AsyncMock(return_value=[[0.1] * 8])
+
+        with (
+            patch("app.core.config.settings.retrieval_mode", "v1"),
+            patch("app.services.admin.qdrant_client", store),
+            patch("app.services.admin.embed_texts", embed),
+        ):
+            await admin_service.update_chunk(db, tenant_a.id, project.id, chunk.id, "texte revise")
+
+        assert len(store.points) == 1
+        self._assert_named_vectors(store.points[0].vector, [0.1] * 8)
+
+    async def test_split_writes_named_dense_and_sparse_vectors_in_v1(
+        self, db: AsyncSession, tenant_a: Tenant
+    ) -> None:
+        project = await _project_of(db, tenant_a)
+        document = await _document_of(db, project, "cctp.pdf", type="CCTP", lot="LOT 01")
+        chunk = await _chunk_of(
+            db, document, "premiere partie et seconde partie", qdrant_point_id="p-1"
+        )
+        store = FakeQdrant()
+        embed = AsyncMock(return_value=[[0.1] * 8, [0.2] * 8])
+
+        with (
+            patch("app.core.config.settings.retrieval_mode", "v1"),
+            patch("app.services.admin.qdrant_client", store),
+            patch("app.services.admin.embed_texts", embed),
+        ):
+            await admin_service.split_chunk(db, tenant_a.id, project.id, chunk.id, 17)
+
+        assert len(store.points) == 2
+        self._assert_named_vectors(store.points[0].vector, [0.1] * 8)
+        self._assert_named_vectors(store.points[1].vector, [0.2] * 8)
+
+    async def test_merge_writes_a_named_dense_and_sparse_vector_in_v1(
+        self, db: AsyncSession, tenant_a: Tenant
+    ) -> None:
+        project = await _project_of(db, tenant_a)
+        document = await _document_of(db, project, "cctp.pdf", type="CCTP", lot="LOT 01")
+        first = await _chunk_of(db, document, "premiere partie", position=0, qdrant_point_id="p-1")
+        second = await _chunk_of(db, document, "seconde partie", position=1, qdrant_point_id="p-2")
+        store = FakeQdrant()
+        embed = AsyncMock(return_value=[[0.1] * 8])
+
+        with (
+            patch("app.core.config.settings.retrieval_mode", "v1"),
+            patch("app.services.admin.qdrant_client", store),
+            patch("app.services.admin.embed_texts", embed),
+        ):
+            await admin_service.merge_chunks(db, tenant_a.id, project.id, first.id, second.id)
+
+        assert len(store.points) == 1
+        self._assert_named_vectors(store.points[0].vector, [0.1] * 8)

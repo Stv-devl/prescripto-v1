@@ -11,7 +11,6 @@ from qdrant_client.models import (
     Filter,
     MatchValue,
     OverwritePayloadOperation,
-    PointStruct,
     SetPayload,
     SetPayloadOperation,
     UpdateOperation,
@@ -50,6 +49,7 @@ from app.schemas.admin import (
 from app.services.ingestion.chunking import _extract_keywords, _extract_localisation
 from app.services.ingestion.embedding import (
     COLLECTION_NAME,
+    build_point,
     delete_document_vectors,
     embed_texts,
 )
@@ -1041,13 +1041,7 @@ async def update_chunk(
 
     await qdrant_client.upsert(
         collection_name=COLLECTION_NAME,
-        points=[
-            PointStruct(
-                id=chunk.qdrant_point_id,
-                vector=vectors[0],
-                payload=payload,
-            )
-        ],
+        points=[build_point(chunk.qdrant_point_id, vectors[0], payload)],
     )
 
     await db.commit()
@@ -1158,8 +1152,8 @@ async def split_chunk(
     await qdrant_client.upsert(
         collection_name=COLLECTION_NAME,
         points=[
-            PointStruct(id=point_id_a, vector=vectors[0], payload=payload_a),
-            PointStruct(id=point_id_b, vector=vectors[1], payload=payload_b),
+            build_point(point_id_a, vectors[0], payload_a),
+            build_point(point_id_b, vectors[1], payload_b),
         ],
     )
 
@@ -1246,7 +1240,7 @@ async def merge_chunks(
     await qdrant_client.upsert(
         collection_name=COLLECTION_NAME,
         points=[
-            PointStruct(id=new_point_id, vector=vectors[0], payload=payload),
+            build_point(new_point_id, vectors[0], payload),
         ],
     )
 
