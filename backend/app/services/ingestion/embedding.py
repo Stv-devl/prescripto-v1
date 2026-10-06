@@ -20,6 +20,7 @@ from app.core.qdrant import qdrant_client
 from app.services.ingestion.chunking import TextChunk
 from app.services.ingestion.injection_marking import mark_suspect_points
 from app.services.qdrant_payload import ChunkPayloadFields, build_chunk_payload
+from app.services.sparse import to_hybrid_point
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,17 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     raise last_exc  # type: ignore[misc]
 
 
+def build_point(point_id: str, vector: list[float], payload: dict[str, object]) -> PointStruct:
+    """Build a point in the vector shape of the active collection.
+
+    `documents_v1` only accepts named `dense` + `sparse` vectors, so every writer
+    into `COLLECTION_NAME` goes through here rather than building `PointStruct`.
+    """
+    if settings.retrieval_mode == "v1":
+        return to_hybrid_point(point_id, vector, payload)
+    return PointStruct(id=point_id, vector=vector, payload=payload)
+
+
 async def index_chunks(
     chunks: list[TextChunk],
     *,
@@ -180,13 +192,7 @@ async def index_chunks(
                 ingested_at=ingested_at,
             )
 
-            points.append(
-                PointStruct(
-                    id=point_id,
-                    vector=vector,
-                    payload=payload,
-                )
-            )
+            points.append(build_point(point_id, vector, payload))
 
         await qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points)
         await mark_suspect_points(

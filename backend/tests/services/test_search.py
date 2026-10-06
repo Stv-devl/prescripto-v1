@@ -410,3 +410,58 @@ class TestResultsCarryTheQdrantPointId:
             )
 
         assert [r.point_id for r in results] == ["7d3e9a52-4b1c-4f6e-8a21-5c0d9e3b7f14"]
+
+
+class TestRetrievePointPayloadFiltersInTheQuery:
+    """The id lookup carries the tenant filter in the query itself (06-database.md)."""
+
+    class _NoUnfilteredLookupQdrant(FakeQdrant):
+        async def retrieve(
+            self,
+            *,
+            collection_name: str,
+            ids: list[str],
+            with_payload: bool = True,
+            with_vectors: bool = False,
+        ) -> list[FakePoint]:
+            raise AssertionError("unfiltered lookup by id")
+
+    async def test_returns_the_callers_own_point_without_an_unfiltered_lookup(self) -> None:
+        tenant = uuid.uuid4()
+        project = uuid.uuid4()
+        store = self._NoUnfilteredLookupQdrant(
+            [_chunk("a-moi", tenant_id=tenant, project_id=project)]
+        )
+
+        with patch("app.services.search.qdrant_client", store):
+            payload = await retrieve_point_payload("a-moi", tenant_id=tenant)
+
+        assert payload is not None
+        assert payload["tenant_id"] == str(tenant)
+        assert payload["text"] == "a-moi"
+
+    async def test_returns_none_for_another_tenants_point_without_an_unfiltered_lookup(
+        self,
+    ) -> None:
+        tenant_a, tenant_b = uuid.uuid4(), uuid.uuid4()
+        project = uuid.uuid4()
+        store = self._NoUnfilteredLookupQdrant(
+            [_chunk("au-voisin", tenant_id=tenant_b, project_id=project)]
+        )
+
+        with patch("app.services.search.qdrant_client", store):
+            payload = await retrieve_point_payload("au-voisin", tenant_id=tenant_a)
+
+        assert payload is None
+
+    async def test_returns_none_for_a_missing_point(self) -> None:
+        tenant = uuid.uuid4()
+        project = uuid.uuid4()
+        store = self._NoUnfilteredLookupQdrant(
+            [_chunk("autre", tenant_id=tenant, project_id=project)]
+        )
+
+        with patch("app.services.search.qdrant_client", store):
+            payload = await retrieve_point_payload("inconnu", tenant_id=tenant)
+
+        assert payload is None

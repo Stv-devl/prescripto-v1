@@ -9,6 +9,7 @@ from qdrant_client.models import (
     Filter,
     Fusion,
     FusionQuery,
+    HasIdCondition,
     MatchValue,
     Prefetch,
     ScoredPoint,
@@ -673,27 +674,24 @@ async def search_merged(
 async def retrieve_point_payload(point_id: str, tenant_id: uuid.UUID) -> dict[str, object] | None:
     """Retrieve the full Qdrant payload for a single point, scoped to the tenant.
 
-    Qdrant's `retrieve` takes IDs, not a filter, so the isolation check happens on
-    the returned payload: a point owned by another tenant is reported as missing.
+    The id and the tenant are both conditions of the query, so a point owned by
+    another tenant never leaves Qdrant and reads exactly like a missing one.
     """
-    results = await qdrant_client.retrieve(
+    records, _ = await qdrant_client.scroll(
         collection_name=COLLECTION_NAME,
-        ids=[point_id],
+        scroll_filter=Filter(
+            must=[
+                HasIdCondition(has_id=[point_id]),
+                FieldCondition(key="tenant_id", match=MatchValue(value=str(tenant_id))),
+            ]
+        ),
+        limit=1,
         with_payload=True,
         with_vectors=False,
     )
-    if not results:
+    if not records:
         return None
-
-    payload = results[0].payload or {}
-    if payload.get("tenant_id") != str(tenant_id):
-        logger.warning(
-            "[SEARCH] Point %s requested by tenant %s belongs to another tenant",
-            point_id,
-            tenant_id,
-        )
-        return None
-    return payload
+    return records[0].payload or {}
 
 
 async def count_document_points(

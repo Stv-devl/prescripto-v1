@@ -316,3 +316,90 @@ class TestIndexChunksInjectionMarking:
         marked = [p.payload["position"] for p in store.points if "injection_suspect" in p.payload]
         assert len(store.points) == 11
         assert marked == [10]
+
+
+class TestIndexChunksVectorShape:
+    """The vector shape `index_chunks` writes must match the collection of its mode."""
+
+    @staticmethod
+    async def _index_one(store: FakeQdrant, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+        from app.services.ingestion import embedding as embedding_module
+        from app.services.ingestion.chunking import TextChunk
+
+        chunk = TextChunk(
+            text="Doublage en plaque de platre.",
+            page=3,
+            position=7,
+            parent_sections=["2. Second oeuvre"],
+            section_title="2.3 Cloisons",
+            heading_prefix="2.3",
+            chunk_lot="LOT 02 - Cloisons",
+            content_type="prescription",
+            keywords=["doublage"],
+            localisation=["R+1"],
+            char_count=29,
+        )
+
+        async def _vectors(texts: list[str]) -> list[list[float]]:
+            return [[0.1] * 8 for _ in texts]
+
+        monkeypatch.setattr(embedding_module, "embed_texts", _vectors)
+
+        with (
+            patch("app.services.ingestion.embedding.qdrant_client", store),
+            patch("app.services.ingestion.injection_marking.qdrant_client", store),
+            patch("app.services.ingestion.embedding.settings.retrieval_mode", mode),
+        ):
+            await embedding_module.index_chunks(
+                [chunk],
+                tenant_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+                project_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                document_id=uuid.UUID("33333333-3333-3333-3333-333333333333"),
+                doc_type="CCTP",
+                lot="LOT 01 - Gros oeuvre",
+                phase="PRO",
+                filename="cctp.pdf",
+                ingested_at=None,
+            )
+
+    async def test_v1_writes_a_named_dense_and_sparse_vector(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from qdrant_client.models import SparseVector
+
+        store = FakeQdrant()
+
+        await self._index_one(store, monkeypatch, "v1")
+
+        vector = store.points[0].vector
+        assert isinstance(vector, dict)
+        assert set(vector) == {"dense", "sparse"}
+        assert vector["dense"] == [0.1] * 8
+        sparse = vector["sparse"]
+        assert isinstance(sparse, SparseVector)
+        assert len(sparse.indices) > 0
+        assert len(sparse.indices) == len(sparse.values)
+
+    async def test_v1_sparse_matches_the_hybrid_backfill_for_the_same_payload(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.services.sparse import to_hybrid_point
+
+        store = FakeQdrant()
+
+        await self._index_one(store, monkeypatch, "v1")
+
+        point = store.points[0]
+        assert isinstance(point.vector, dict)
+        reference = to_hybrid_point(point.id, [0.1] * 8, point.payload).vector
+        assert isinstance(reference, dict)
+        assert point.vector["sparse"] == reference["sparse"]
+
+    async def test_baseline_keeps_the_unnamed_dense_vector(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = FakeQdrant()
+
+        await self._index_one(store, monkeypatch, "baseline")
+
+        assert store.points[0].vector == [0.1] * 8

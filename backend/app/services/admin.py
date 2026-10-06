@@ -11,7 +11,6 @@ from qdrant_client.models import (
     Filter,
     MatchValue,
     OverwritePayloadOperation,
-    PointStruct,
     SetPayload,
     SetPayloadOperation,
     UpdateOperation,
@@ -50,6 +49,7 @@ from app.schemas.admin import (
 from app.services.ingestion.chunking import _extract_keywords, _extract_localisation
 from app.services.ingestion.embedding import (
     COLLECTION_NAME,
+    build_point,
     delete_document_vectors,
     embed_texts,
 )
@@ -1041,17 +1041,23 @@ async def update_chunk(
 
     await qdrant_client.upsert(
         collection_name=COLLECTION_NAME,
-        points=[
-            PointStruct(
-                id=chunk.qdrant_point_id,
-                vector=vectors[0],
-                payload=payload,
-            )
-        ],
+        points=[build_point(chunk.qdrant_point_id, vectors[0], payload)],
     )
 
     await db.commit()
     return ChunkMutationResponse(message="Chunk mis à jour", chunk_ids=[chunk.id])
+
+
+async def _delete_replaced_points(point_ids: list[str]) -> None:
+    """Delete the points a committed split/merge replaced.
+
+    Runs last on purpose: a failure here leaves a stale duplicate in the index,
+    whereas deleting first lost the passage whenever a later step failed.
+    """
+    try:
+        await qdrant_client.delete(collection_name=COLLECTION_NAME, points_selector=point_ids)
+    except Exception:
+        logger.warning("Stale Qdrant points left after chunk rewrite: %s", point_ids, exc_info=True)
 
 
 async def split_chunk(
@@ -1100,11 +1106,6 @@ async def split_chunk(
 
     await db.delete(chunk)
     await db.flush()
-
-    await qdrant_client.delete(
-        collection_name=COLLECTION_NAME,
-        points_selector=[old_point_id],
-    )
 
     id_a = uuid.uuid4()
     id_b = uuid.uuid4()
@@ -1158,12 +1159,13 @@ async def split_chunk(
     await qdrant_client.upsert(
         collection_name=COLLECTION_NAME,
         points=[
-            PointStruct(id=point_id_a, vector=vectors[0], payload=payload_a),
-            PointStruct(id=point_id_b, vector=vectors[1], payload=payload_b),
+            build_point(point_id_a, vectors[0], payload_a),
+            build_point(point_id_b, vectors[1], payload_b),
         ],
     )
 
     await db.commit()
+    await _delete_replaced_points([old_point_id])
     return ChunkMutationResponse(
         message="Chunk découpé en 2",
         chunk_ids=[id_a, id_b],
@@ -1200,11 +1202,6 @@ async def merge_chunks(
     await db.delete(chunk_a)
     await db.delete(chunk_b)
     await db.flush()
-
-    await qdrant_client.delete(
-        collection_name=COLLECTION_NAME,
-        points_selector=[old_point_a, old_point_b],
-    )
 
     shift_stmt = (
         update(Chunk)
@@ -1246,11 +1243,12 @@ async def merge_chunks(
     await qdrant_client.upsert(
         collection_name=COLLECTION_NAME,
         points=[
-            PointStruct(id=new_point_id, vector=vectors[0], payload=payload),
+            build_point(new_point_id, vectors[0], payload),
         ],
     )
 
     await db.commit()
+    await _delete_replaced_points([old_point_a, old_point_b])
     return ChunkMutationResponse(
         message="Chunks fusionnés",
         chunk_ids=[new_id],

@@ -6,41 +6,58 @@ actual code (file paths, real snippets), not the intended design.
 - [`auth-and-tenancy.md`](./auth-and-tenancy.md) — JWT, bcrypt, the
   `tenant_id` isolation discipline, the local-only dev auth bypass.
 - [`ingestion-pipeline.md`](./ingestion-pipeline.md) — upload → extraction →
-  classification → chunking → embedding → Qdrant.
-- [`rag-chat.md`](./rag-chat.md) — retrieval, prompt construction, streamed
-  generation, source traceability.
+  cleaning → classification → chunking → dense + sparse vectors → Qdrant,
+  and the prompt-injection flag set at ingestion.
+- [`rag-chat.md`](./rag-chat.md) — the LangGraph chat graph: query rewrite,
+  hybrid retrieval, context assembly, model routing, the broad-scope judge
+  and tool retry, streamed generation, source traceability.
+- [`mcp.md`](./mcp.md) — the MCP server on `/mcp`: two read-only tools shared
+  by external MCP clients and the agent's own retry, its security model and
+  prompt-injection defences.
 - [`data-model.md`](./data-model.md) — the Postgres schema, the FK graph,
   the project-summary feature.
 - [`frontend.md`](./frontend.md) — feature-slice layout, the service/hook
   boundary, SSE consumption on the client side.
+- [`deployment.md`](./deployment.md) — the AWS production topology, the
+  container, the production lock-down, logs and alarms.
+- [`ci.md`](./ci.md) — the four required checks on `main`, including the
+  retrieval-recall eval gate on a self-hosted runner.
 
 ## System diagram
 
 ```mermaid
 flowchart LR
-    subgraph Client["client/ — React 19 + TS"]
+    subgraph Client["client/ — React 19 + TS (Vercel)"]
         UI["Features\nauth · projects · chat · summary · admin · settings"]
     end
 
-    subgraph API["backend/app/ — FastAPI"]
+    EXT["External MCP client\nClaude Code · Claude Desktop · Cursor"]
+
+    subgraph API["backend/app/ — FastAPI (ECS Fargate)"]
         AUTH["auth: JWT + tenant_id\nDepends(get_current_user)"]
-        ING["ingestion:\nextract → classify → chunk → embed"]
-        CHAT["chat:\nretrieve → prompt → stream"]
+        ING["ingestion:\nextract → clean → classify → chunk → embed"]
+        CHAT["chat (LangGraph):\nrewrite → hybrid search → enrich\n→ judge / tool retry → generate"]
+        MCP["MCP server /mcp\nsearch_documents · read_passage"]
         SUM["summary:\n16-section extraction"]
     end
 
-    PG[("PostgreSQL\nprojects, documents, chunks,\nconversations, messages")]
-    QD[("Qdrant\ncollection: documents\ntenant_id + project_id filtered")]
-    MISTRAL["Mistral\nmistral-embed · mistral-large-latest"]
+    PG[("PostgreSQL (RDS)\nprojects, documents, chunks,\nconversations, messages")]
+    QD[("Qdrant Cloud\ndense + sparse vectors\ntenant_id + project_id filtered")]
+    MISTRAL["Mistral\nmistral-embed · mistral-large · mistral-small"]
+    LS["LangSmith\ntracing"]
 
     UI -->|JWT bearer| AUTH
+    EXT -->|JWT bearer| MCP
     AUTH --> ING & CHAT & SUM
+    CHAT -->|in-memory MCP session| MCP
     ING --> PG
     ING --> MISTRAL
     ING --> QD
     CHAT --> QD
     CHAT --> MISTRAL
     CHAT --> PG
+    CHAT -.-> LS
+    MCP --> QD
     SUM --> QD
     SUM --> MISTRAL
     SUM --> PG
@@ -49,13 +66,12 @@ flowchart LR
 ## Where the code diverges from the original design
 
 `docs/architecture-rag.md` was written before the RAG pipeline existed, as
-a design proposal. It's kept as-is for the historical record, but three of
-its ideas were never built — worth knowing before reading it as current
-truth:
+a design proposal. It's kept as-is for the historical record, but some of its
+ideas were never built — worth knowing before reading it as current truth:
 
 | Proposed | Actual state |
 | --- | --- |
-| Cross-encoder re-ranking of retrieved chunks | Not implemented — ranking is Qdrant cosine similarity plus a couple of hand-written score penalties (see [`rag-chat.md`](./rag-chat.md#retrieval)) |
+| Cross-encoder re-ranking of retrieved chunks | Not in the code — ordering is the dense + BM25 fusion plus a couple of hand-written score penalties (see [`rag-chat.md`](./rag-chat.md#retrieval)) |
 | A tenant-wide "global search" mode across projects | Not implemented — every search is project-scoped (see [`rag-chat.md`](./rag-chat.md#scope-honestly)) |
 | Per-chunk `date` metadata | Not extracted — only an `ingested_at` timestamp exists |
 
