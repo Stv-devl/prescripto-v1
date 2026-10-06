@@ -835,3 +835,195 @@ class TestMutationVectorShapeInV1:
 
         assert len(store.points) == 1
         self._assert_named_vectors(store.points[0].vector, [0.1] * 8)
+
+
+class TestSplitMergeKeepTheOldPointOnFailure:
+    """A split or merge that fails must not lose the passage it was rewriting.
+
+    Today both delete the old point(s) first, then embed and upsert: any failure
+    after the delete leaves the chunk in Postgres with no vector, silently out of
+    retrieval. The success cases guard the other direction: the old point(s) must
+    still be removed once the new ones are written.
+    """
+
+    class _UpsertFailsQdrant(FakeQdrant):
+        async def upsert(self, *, collection_name: str, points: list[object]) -> None:
+            raise RuntimeError("qdrant down")
+
+    @staticmethod
+    def _old_point(tenant: Tenant, point_id: str, text: str) -> FakePoint:
+        return FakePoint(id=point_id, payload={"tenant_id": str(tenant.id), "text": text})
+
+    async def test_a_split_whose_embedding_fails_keeps_the_old_point(
+        self, db: AsyncSession, tenant_a: Tenant
+    ) -> None:
+        project = await _project_of(db, tenant_a)
+        document = await _document_of(db, project, "cctp.pdf", type="CCTP", lot="LOT 01")
+        chunk = await _chunk_of(
+            db, document, "premiere partie et seconde partie", qdrant_point_id="p-1"
+        )
+        store = FakeQdrant(
+            [self._old_point(tenant_a, "p-1", "premiere partie et seconde partie")]
+        )
+        embed = AsyncMock(side_effect=RuntimeError("mistral down"))
+
+        with (
+            patch("app.services.admin.qdrant_client", store),
+            patch("app.services.admin.embed_texts", embed),
+            pytest.raises(RuntimeError),
+        ):
+            await admin_service.split_chunk(db, tenant_a.id, project.id, chunk.id, 17)
+
+        assert "p-1" in [p.id for p in store.points]
+
+    async def test_a_merge_whose_embedding_fails_keeps_both_old_points(
+        self, db: AsyncSession, tenant_a: Tenant
+    ) -> None:
+        project = await _project_of(db, tenant_a)
+        document = await _document_of(db, project, "cctp.pdf", type="CCTP", lot="LOT 01")
+        first = await _chunk_of(db, document, "premiere partie", position=0, qdrant_point_id="p-1")
+        second = await _chunk_of(db, document, "seconde partie", position=1, qdrant_point_id="p-2")
+        store = FakeQdrant(
+            [
+                self._old_point(tenant_a, "p-1", "premiere partie"),
+                self._old_point(tenant_a, "p-2", "seconde partie"),
+            ]
+        )
+        embed = AsyncMock(side_effect=RuntimeError("mistral down"))
+
+        with (
+            patch("app.services.admin.qdrant_client", store),
+            patch("app.services.admin.embed_texts", embed),
+            pytest.raises(RuntimeError),
+        ):
+            await admin_service.merge_chunks(db, tenant_a.id, project.id, first.id, second.id)
+
+        remaining = [p.id for p in store.points]
+        assert "p-1" in remaining
+        assert "p-2" in remaining
+
+    async def test_a_split_whose_upsert_fails_keeps_the_old_point(
+        self, db: AsyncSession, tenant_a: Tenant
+    ) -> None:
+        project = await _project_of(db, tenant_a)
+        document = await _document_of(db, project, "cctp.pdf", type="CCTP", lot="LOT 01")
+        chunk = await _chunk_of(
+            db, document, "premiere partie et seconde partie", qdrant_point_id="p-1"
+        )
+        store = self._UpsertFailsQdrant(
+            [self._old_point(tenant_a, "p-1", "premiere partie et seconde partie")]
+        )
+        embed = AsyncMock(return_value=[[0.1] * 8, [0.2] * 8])
+
+        with (
+            patch("app.services.admin.qdrant_client", store),
+            patch("app.services.admin.embed_texts", embed),
+            pytest.raises(RuntimeError),
+        ):
+            await admin_service.split_chunk(db, tenant_a.id, project.id, chunk.id, 17)
+
+        assert "p-1" in [p.id for p in store.points]
+
+    async def test_a_merge_whose_upsert_fails_keeps_both_old_points(
+        self, db: AsyncSession, tenant_a: Tenant
+    ) -> None:
+        project = await _project_of(db, tenant_a)
+        document = await _document_of(db, project, "cctp.pdf", type="CCTP", lot="LOT 01")
+        first = await _chunk_of(db, document, "premiere partie", position=0, qdrant_point_id="p-1")
+        second = await _chunk_of(db, document, "seconde partie", position=1, qdrant_point_id="p-2")
+        store = self._UpsertFailsQdrant(
+            [
+                self._old_point(tenant_a, "p-1", "premiere partie"),
+                self._old_point(tenant_a, "p-2", "seconde partie"),
+            ]
+        )
+        embed = AsyncMock(return_value=[[0.1] * 8])
+
+        with (
+            patch("app.services.admin.qdrant_client", store),
+            patch("app.services.admin.embed_texts", embed),
+            pytest.raises(RuntimeError),
+        ):
+            await admin_service.merge_chunks(db, tenant_a.id, project.id, first.id, second.id)
+
+        remaining = [p.id for p in store.points]
+        assert "p-1" in remaining
+        assert "p-2" in remaining
+
+    async def test_a_successful_split_replaces_the_old_point(
+        self, db: AsyncSession, tenant_a: Tenant
+    ) -> None:
+        project = await _project_of(db, tenant_a)
+        document = await _document_of(db, project, "cctp.pdf", type="CCTP", lot="LOT 01")
+        chunk = await _chunk_of(
+            db, document, "premiere partie et seconde partie", qdrant_point_id="p-1"
+        )
+        store = FakeQdrant(
+            [self._old_point(tenant_a, "p-1", "premiere partie et seconde partie")]
+        )
+        embed = AsyncMock(return_value=[[0.1] * 8, [0.2] * 8])
+
+        with (
+            patch("app.services.admin.qdrant_client", store),
+            patch("app.services.admin.embed_texts", embed),
+        ):
+            await admin_service.split_chunk(db, tenant_a.id, project.id, chunk.id, 17)
+
+        remaining = [p.id for p in store.points]
+        assert len(remaining) == 2
+        assert "p-1" not in remaining
+
+    async def test_a_successful_merge_replaces_both_old_points(
+        self, db: AsyncSession, tenant_a: Tenant
+    ) -> None:
+        project = await _project_of(db, tenant_a)
+        document = await _document_of(db, project, "cctp.pdf", type="CCTP", lot="LOT 01")
+        first = await _chunk_of(db, document, "premiere partie", position=0, qdrant_point_id="p-1")
+        second = await _chunk_of(db, document, "seconde partie", position=1, qdrant_point_id="p-2")
+        store = FakeQdrant(
+            [
+                self._old_point(tenant_a, "p-1", "premiere partie"),
+                self._old_point(tenant_a, "p-2", "seconde partie"),
+            ]
+        )
+        embed = AsyncMock(return_value=[[0.1] * 8])
+
+        with (
+            patch("app.services.admin.qdrant_client", store),
+            patch("app.services.admin.embed_texts", embed),
+        ):
+            await admin_service.merge_chunks(db, tenant_a.id, project.id, first.id, second.id)
+
+        remaining = [p.id for p in store.points]
+        assert len(remaining) == 1
+        assert "p-1" not in remaining
+        assert "p-2" not in remaining
+
+    async def test_a_split_whose_final_delete_fails_still_succeeds_and_keeps_the_new_points(
+        self, db: AsyncSession, tenant_a: Tenant
+    ) -> None:
+        class _DeleteFailsQdrant(FakeQdrant):
+            async def delete(
+                self, *, collection_name: str, points_selector: object = None
+            ) -> None:
+                raise RuntimeError("qdrant down")
+
+        project = await _project_of(db, tenant_a)
+        document = await _document_of(db, project, "cctp.pdf", type="CCTP", lot="LOT 01")
+        chunk = await _chunk_of(
+            db, document, "premiere partie et seconde partie", qdrant_point_id="p-1"
+        )
+        store = _DeleteFailsQdrant(
+            [self._old_point(tenant_a, "p-1", "premiere partie et seconde partie")]
+        )
+        embed = AsyncMock(return_value=[[0.1] * 8, [0.2] * 8])
+
+        with (
+            patch("app.services.admin.qdrant_client", store),
+            patch("app.services.admin.embed_texts", embed),
+        ):
+            result = await admin_service.split_chunk(db, tenant_a.id, project.id, chunk.id, 17)
+
+        assert len(result.chunk_ids) == 2
+        assert len(store.points) == 3
+        assert "p-1" in [p.id for p in store.points]
