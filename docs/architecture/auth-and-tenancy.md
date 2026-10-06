@@ -127,3 +127,15 @@ if credentials is None:
 The default (`environment = "production"`) makes `auto_error` `True` and the
 bypass branch unreachable — a deployment has to explicitly opt in with
 `ENVIRONMENT=local` to lose the auth requirement.
+
+## MCP
+
+The `/mcp` endpoint (read-only tools for external MCP clients) does not use
+`get_current_user`. A dedicated middleware (`backend/app/api/mcp.py`) takes the
+bearer access token, applies the same checks (`type: "access"` and
+`token_version` against the database, via `resolve_bearer_identity`) and
+answers `401` otherwise. The `ENVIRONMENT=local` bypass does not apply: `/mcp`
+always requires a token. The tenant comes only from the token, never from a
+tool argument, every project is checked against it, and every query keeps its
+`tenant_id` filter. Requests are also metered per tenant. Details in
+[`mcp.md`](./mcp.md).

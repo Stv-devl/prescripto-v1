@@ -1,7 +1,7 @@
 # Data model
 
 PostgreSQL 16, SQLAlchemy 2.0 async, Alembic migrations (`backend/alembic/`,
-11 revisions as of this writing). `TenantMixin` adds an indexed, cascading
+15 revisions as of this writing). `TenantMixin` adds an indexed, cascading
 `tenant_id` FK; `TimestampMixin` adds `created_at`/`updated_at` with
 server-side defaults.
 
@@ -10,8 +10,8 @@ server-side defaults.
 | Entity | Table | Tenant-scoped directly? | Notable columns |
 | --- | --- | --- | --- |
 | Tenant | `tenants` | — | `name`, `plan` |
-| User | `users` | yes (`TenantMixin`) | `email` (unique), `hashed_password`, `role`, `token_version` |
-| Project | `projects` | yes (`TenantMixin`) | `name`, `phase`, `status`, `address`, `client`, `architect`, `is_favorite` |
+| User | `users` | yes (`TenantMixin`) | `email` (unique), `hashed_password`, `role`, `first_name`, `last_name`, `email_verified`, `token_version` |
+| Project | `projects` | yes (`TenantMixin`) | `name`, `phase`, `status`, `address`, `client`, `architect`, project-team names and addresses, `is_favorite` |
 | Folder | `folders` | no — via `project_id` | `name`, `lot`, `phase` |
 | Document | `documents` | no — via `project_id` | `filename`, `type`, `lot`, `phase`, `status`, `chunk_count`, `ingested_at` |
 | Chunk | `chunks` | no — via `document_id` | text, page, position, `qdrant_point_id`, keywords, section metadata |
@@ -51,7 +51,8 @@ single-column `WHERE tenant_id = ...` available at that level.
 
 `06-database.md`'s convention of a composite `(tenant_id, <frequent filter>)`
 index is not implemented anywhere in the current schema — only single-column
-indexes exist on FK and unique columns. Every tenant-scoped query today
+indexes exist, on FK and unique columns and on a few `chunks` filter columns
+(`lot`, `type`, `content_type`). Every tenant-scoped query today
 resolves through a join rather than an index built for the filter shape it
 actually runs.
 
