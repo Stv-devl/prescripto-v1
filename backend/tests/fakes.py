@@ -110,6 +110,11 @@ class FakeQdrant:
     def _matches(point: FakePoint, condition_filter: object) -> bool:
         """Every `must` condition holds. Values compare as strings, as Qdrant stores them."""
         for condition in getattr(condition_filter, "must", None) or []:
+            has_id = getattr(condition, "has_id", None)
+            if has_id is not None:
+                if str(point.id) not in {str(i) for i in has_id}:
+                    return False
+                continue
             if str(point.payload.get(condition.key)) != str(condition.match.value):
                 return False
         return True
