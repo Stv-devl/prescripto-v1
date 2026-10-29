@@ -39,6 +39,9 @@ jobs:
   eval:
     needs: guard
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    # The `eval` environment requires the owner's approval before this job reaches the
+    # self-hosted runner: PR code never runs there unreviewed (no admin bypass).
+    environment: eval
     runs-on: [self-hosted, prescripto-eval]
     timeout-minutes: 20
     steps:
