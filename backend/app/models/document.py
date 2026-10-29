@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, Uuid
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
@@ -11,6 +11,7 @@ from app.models.base import Base, TimestampMixin
 
 class Document(TimestampMixin, Base):
     __tablename__ = "documents"
+    __table_args__ = (Index("ix_documents_project_id_created_at", "project_id", "created_at"),)
 
     id: Mapped[uuid.UUID] = mapped_column(default=uuid.uuid4, primary_key=True)
     project_id: Mapped[uuid.UUID] = mapped_column(
