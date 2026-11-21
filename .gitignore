@@ -67,6 +67,7 @@ docs/research-cache/
 docs/product/
 docs/specs/
 docs/work/
+docs/ops/
 
 # === LoopKit — état de session ===
 # Écrit à l'exécution par les hooks et le status line. Jamais versionné :
