@@ -113,3 +113,106 @@ async def test_wait_records_zero_under_a_step(timing_limiter: _RateLimiter) -> N
     with timing.step("rewrite"):
         await timing_limiter.wait()
     assert ("rewrite_wait", 0) in entries
+
+
+@pytest.fixture
+def api_requests(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Replaces the SDK's async HTTP client with a mock transport.
+
+    Returns the list of JSON bodies the SDK actually sends. The transport answers
+    a chat completion as JSON, or as an SSE stream when the body asks for one.
+    """
+    import json
+
+    import httpx
+
+    from app.core.mistral import mistral_client
+
+    sent: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        sent.append(body)
+        if body.get("stream"):
+            chunk = {
+                "id": "cmpl-1",
+                "model": "mistral-large-2512",
+                "choices": [
+                    {"index": 0, "delta": {"content": "Reponse streamee"}, "finish_reason": None}
+                ],
+            }
+            sse = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=sse.encode()
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "cmpl-1",
+                "object": "chat.completion",
+                "model": "mistral-large-2512",
+                "created": 1700000000,
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "Reponse simulee de l'API"},
+                    }
+                ],
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(mistral_client.sdk_configuration, "async_client", client)
+    return sent
+
+
+async def test_d1_a_large_latest_completion_is_sent_to_the_api_as_mistral_large_2512(
+    api_requests: list[dict[str, object]],
+) -> None:
+    from app.core.mistral import mistral_client
+
+    await mistral_client.chat.complete_async(
+        model="mistral-large-latest", messages=[{"role": "user", "content": "x"}]
+    )
+
+    assert [body["model"] for body in api_requests] == ["mistral-large-2512"]
+
+
+async def test_d2_a_large_latest_stream_is_sent_to_the_api_as_mistral_large_2512(
+    api_requests: list[dict[str, object]],
+) -> None:
+    from app.core.mistral import mistral_client
+
+    stream = await mistral_client.chat.stream_async(
+        model="mistral-large-latest", messages=[{"role": "user", "content": "x"}]
+    )
+    async for _event in stream:
+        pass
+
+    assert [body["model"] for body in api_requests] == ["mistral-large-2512"]
+
+
+async def test_d3_an_unpinned_model_is_sent_unchanged(
+    api_requests: list[dict[str, object]],
+) -> None:
+    from app.core.mistral import mistral_client
+
+    await mistral_client.chat.complete_async(
+        model="mistral-small-latest", messages=[{"role": "user", "content": "x"}]
+    )
+
+    assert [body["model"] for body in api_requests] == ["mistral-small-latest"]
+
+
+async def test_d4_the_completion_returned_to_the_caller_is_the_api_response(
+    api_requests: list[dict[str, object]],
+) -> None:
+    from app.core.mistral import mistral_client
+
+    response = await mistral_client.chat.complete_async(
+        model="mistral-large-latest", messages=[{"role": "user", "content": "x"}]
+    )
+
+    assert response.choices[0].message.content == "Reponse simulee de l'API"

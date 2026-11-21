@@ -265,3 +265,11 @@ class TestV1ModelRouting:
     def test_a_zero_fast_rate_is_rejected(self) -> None:
         with pytest.raises(ValidationError):
             _settings(v1_fast_rps=0)
+
+
+class TestOpenAIKey:
+    def test_d5_openai_api_key_is_optional_and_defaults_to_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        assert Settings(_env_file=None, **_BASE).openai_api_key is None  # type: ignore[call-arg]
