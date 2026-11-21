@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     )
 
     mistral_api_key: str
+    openai_api_key: str | None = None
     pixtral_large_model: str = "pixtral-large-latest"
     pixtral_small_model: str = "pixtral-12b-2409"
     vision_dpi: int = 200

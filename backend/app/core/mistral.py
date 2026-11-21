@@ -8,11 +8,55 @@ import asyncio
 import time
 
 from mistralai.client import Mistral
+from mistralai.client.chat import Chat
+from mistralai.client.models import ChatCompletionResponse, CompletionEvent
+from mistralai.client.utils.eventstreaming import EventStreamAsync
 
 from app.core import timing
 from app.core.config import settings
 
-mistral_client = Mistral(api_key=settings.mistral_api_key)
+MODEL_PINS: dict[str, str] = {"mistral-large-latest": "mistral-large-2512"}
+
+
+def pinned_model(model: str) -> str:
+    """The exact model version sent to the API for `model`.
+
+    `mistral-large-latest` now resolves to mistral-large-4, a reasoning model whose replies
+    carry `ThinkChunk` lists; the prompts, quota and parsing were tuned for mistral-large-2512
+    (docs/work/mistral-large-4-alias/debug.md)."""
+    return MODEL_PINS.get(model, model)
+
+
+class _PinnedChat:
+    """The SDK's `chat`, with the model name pinned before each request."""
+
+    def __init__(self, chat: Chat) -> None:
+        self._chat = chat
+
+    async def complete_async(self, *, model: str, **kwargs: object) -> ChatCompletionResponse:
+        return await self._chat.complete_async(model=pinned_model(model), **kwargs)  # type: ignore[arg-type]
+
+    async def stream_async(
+        self, *, model: str, **kwargs: object
+    ) -> EventStreamAsync[CompletionEvent]:
+        return await self._chat.stream_async(model=pinned_model(model), **kwargs)  # type: ignore[arg-type]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._chat, name)
+
+
+class _PinnedMistral:
+    """The SDK client; `chat` pins model names, every other attribute is the SDK's own."""
+
+    def __init__(self, client: Mistral) -> None:
+        self._client = client
+        self.chat = _PinnedChat(client.chat)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._client, name)
+
+
+mistral_client = _PinnedMistral(Mistral(api_key=settings.mistral_api_key))
 
 MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS = {"input": 0.5, "output": 1.5}
 
