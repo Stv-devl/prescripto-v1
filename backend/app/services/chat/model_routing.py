@@ -1,6 +1,7 @@
 """Model routing of the short chat calls (query rewrite, sufficiency judge, retry
 reformulation): which model each one calls, and at what price its usage is counted
-(j3-routage-mistral-small). Generation always stays on mistral-large.
+(j3-routage-mistral-small). Generation always requests mistral-large; with
+CHAT_PROVIDER=openai, `effective_model` maps it to the configured OpenAI model.
 
 Also the v1 prompt-cache keys of the four chat calls and the pricing of cached input
 tokens (j3-prompt-caching)."""

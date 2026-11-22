@@ -137,6 +137,18 @@ async def complete(
     )
 
 
+def _add_openai_sampling(kwargs: dict[str, object], temperature: float) -> None:
+    """Set temperature and reasoning effort on an OpenAI call.
+
+    Reasoning models reject any non-default temperature once a reasoning effort other than
+    `none` is requested (HTTP 400), so temperature is only sent without reasoning."""
+    effort = settings.openai_reasoning_effort
+    if effort is None or effort == "none":
+        kwargs["temperature"] = temperature
+    if effort is not None:
+        kwargs["reasoning_effort"] = effort
+
+
 async def _complete_openai(
     *,
     model: str,
@@ -148,7 +160,8 @@ async def _complete_openai(
     tools: list[dict[str, object]] | None,
 ) -> ChatReply:
     called = _openai_model(model)
-    kwargs: dict[str, object] = {"model": called, "messages": messages, "temperature": temperature}
+    kwargs: dict[str, object] = {"model": called, "messages": messages}
+    _add_openai_sampling(kwargs, temperature)
     if max_tokens is not None:
         kwargs["max_completion_tokens"] = max_tokens
     if json_mode:
@@ -159,8 +172,6 @@ async def _complete_openai(
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "required"
         kwargs["parallel_tool_calls"] = True
-    if settings.openai_reasoning_effort is not None:
-        kwargs["reasoning_effort"] = settings.openai_reasoning_effort
     response = await get_openai_client().chat.completions.create(**kwargs)  # type: ignore[call-overload]
     message = response.choices[0].message
     return ChatReply(
@@ -187,14 +198,12 @@ async def open_stream(
         kwargs: dict[str, object] = {
             "model": _openai_model(model),
             "messages": messages,
-            "temperature": temperature,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        _add_openai_sampling(kwargs, temperature)
         if cache_key:
             kwargs["prompt_cache_key"] = cache_key
-        if settings.openai_reasoning_effort is not None:
-            kwargs["reasoning_effort"] = settings.openai_reasoning_effort
         chunks = await get_openai_client().chat.completions.create(**kwargs)  # type: ignore[call-overload]
         async for chunk in chunks:
             text = chunk.choices[0].delta.content if chunk.choices else None

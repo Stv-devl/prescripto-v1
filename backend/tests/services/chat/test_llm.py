@@ -530,3 +530,55 @@ async def test_b36_openai_usage_without_prompt_tokens_details_gives_zero_cached_
     assert reply.usage is not None
     assert reply.usage.prompt_tokens == 300
     assert cached_tokens_of(reply.usage) == 0
+
+
+async def test_b37_openai_complete_omits_temperature_when_a_reasoning_effort_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.chat.llm import complete
+
+    monkeypatch.setattr(settings, "chat_provider", "openai")
+    openai = FakeOpenAI(usage=openai_usage(10, 0))
+    install_openai(monkeypatch, openai)
+
+    for effort in ("low", "none", None, "medium"):
+        monkeypatch.setattr(settings, "openai_reasoning_effort", effort)
+        await complete(
+            FakeMistral(), FakeLimiter(), model=LARGE, messages=MESSAGES, temperature=0.0
+        )
+
+    assert "temperature" not in openai.calls[0]
+    assert openai.calls[1]["temperature"] == 0.0
+    assert openai.calls[2]["temperature"] == 0.0
+    assert "temperature" not in openai.calls[3]
+
+
+async def test_b38_openai_stream_omits_temperature_when_a_reasoning_effort_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.chat.llm import open_stream
+
+    monkeypatch.setattr(settings, "chat_provider", "openai")
+    openai = FakeOpenAI(chunks=[openai_chunk("Bon"), openai_chunk("jour")])
+    install_openai(monkeypatch, openai)
+
+    monkeypatch.setattr(settings, "openai_reasoning_effort", "low")
+    await collect(open_stream(FakeMistral(), model=LARGE, messages=MESSAGES, temperature=0.1))
+    monkeypatch.setattr(settings, "openai_reasoning_effort", "none")
+    await collect(open_stream(FakeMistral(), model=LARGE, messages=MESSAGES, temperature=0.1))
+
+    assert "temperature" not in openai.calls[0]
+    assert openai.calls[1]["temperature"] == 0.1
+
+
+async def test_b39_mistral_keeps_temperature_whatever_the_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.chat.llm import complete
+
+    monkeypatch.setattr(settings, "openai_reasoning_effort", "low")
+    mistral = FakeMistral()
+
+    await complete(mistral, FakeLimiter(), model=LARGE, messages=MESSAGES, temperature=0.0)
+
+    assert mistral.complete_kwargs[0]["temperature"] == 0.0
