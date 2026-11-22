@@ -373,6 +373,67 @@ _ORDER_LINE_V1 = (
     "UNIQUEMENT s'il y a au moins une norme à citer (règle d) — rien après. "
     "Une réponse sans bloc Normes est correcte.\n"
 )
+_CONCISION_RULE_BASELINE = (
+    "4. Sois CONCIS : va droit au fait, pas de paraphrase ni de formules de politesse.\n"
+)
+_CONCISION_RULE_V1 = (
+    "4. CONCIS = pas de paraphrase, pas de formule de politesse, pas de phrase de remplissage. "
+    "CONCIS ne veut PAS dire moins de données : reprends CHAQUE valeur chiffrée, dimension, "
+    "référence, marque, modèle, classement, variante et norme du contexte qui concerne "
+    "l'ouvrage demandé. Coupe les mots, jamais les données.\n"
+)
+_LENGTH_RULE_BASELINE = "6. Réponds en 2 à 6 phrases par point. Question simple = une phrase.\n"
+_LENGTH_RULE_V1 = (
+    "6. Question à valeur unique (une épaisseur, un volume, un DTU) = une phrase complète "
+    "qui reprend l'objet de la question. Question oui/non = « Oui, … » ou « Non, … » en une "
+    "phrase complète qui reprend l'objet de la question, jamais un mot seul. "
+    "Sinon, 2 à 6 phrases par point.\n"
+)
+_LOTS_RULE_END_BASELINE = "Recopie les intitulés EXACTEMENT.\n"
+_LOTS_RULE_END_V1 = (
+    "Recopie les intitulés EXACTEMENT. "
+    "Le contexte est découpé en blocs « === NN - INTITULÉ === » : un passage appartient au "
+    "lot du bloc où il se trouve. Ces séparateurs servent à te repérer : ne les recopie "
+    "jamais dans la réponse. Question sur la répartition entre lots (quels lots, qui "
+    "fait quoi, prestations des différents lots) : une partie par lot, ouverte par "
+    "l'intitulé de son bloc, chaque prestation sous le lot de son bloc — jamais un lot "
+    "déduit du sujet de la prestation.\n"
+    "7 bis. NORME DEMANDÉE : si la question demande « la norme », « le DTU » ou « quelle "
+    "norme » et que le contexte en contient plusieurs pour le lot ou l'ouvrage visé, "
+    "cite-les TOUTES, chacune avec son objet. Ne choisis pas.\n"
+)
+_LIST_RULE_BASELINE = "un composant par ligne. "
+_LIST_RULE_V1 = (
+    "un composant par ligne. Dès que l'ouvrage a au moins deux composants ou "
+    "caractéristiques, cette liste est OBLIGATOIRE — jamais un paragraphe. "
+    "Si au moins une norme du contexte se rapporte à l'ouvrage (règle d), "
+    "le bloc **Normes** est OBLIGATOIRE. "
+)
+_LOCALISATION_RULE_START = "   c) LOCALISATION :\n"
+_LOCALISATION_RULE_END = "   **Localisation :** liste récapitulative de toutes les variantes.\n"
+_LOCALISATION_RULE_V1 = (
+    "   c) UN SEUL bloc **Localisation :** à la toute fin, récapitulatif de toutes les "
+    "variantes — jamais au milieu, jamais après une variante.\n"
+)
+_FINAL_VALIDATION_RULE = "13. VALIDATION FINALE (OBLIGATOIRE) :\n"
+
+
+def _v1_answer_rules(prompt: str) -> str:
+    """Rewrite the answer rules for v1: concision keeps data, lots from the context blocks."""
+    prompt = prompt[: prompt.index(_FINAL_VALIDATION_RULE)]
+    start = prompt.index(_LOCALISATION_RULE_START)
+    end = prompt.index(_LOCALISATION_RULE_END) + len(_LOCALISATION_RULE_END)
+    prompt = prompt[:start] + _LOCALISATION_RULE_V1 + prompt[end:]
+    for baseline, v1 in (
+        (_CONCISION_RULE_BASELINE, _CONCISION_RULE_V1),
+        (_LENGTH_RULE_BASELINE, _LENGTH_RULE_V1),
+        (_LOTS_RULE_END_BASELINE, _LOTS_RULE_END_V1),
+        (_LIST_RULE_BASELINE, _LIST_RULE_V1),
+    ):
+        prompt = prompt.replace(baseline, v1, 1)
+    return prompt
+
+
 _LOCALISATION_NORMES_BASELINE = "(avant Normes)"
 _LOCALISATION_NORMES_V1 = "(avant le bloc Normes s'il y en a un)"
 
@@ -380,8 +441,10 @@ _LOCALISATION_NORMES_V1 = "(avant le bloc Normes s'il y en a un)"
 def system_prompt_for(mode: RetrievalMode) -> str:
     """Return the RAG system prompt served in the given retrieval mode."""
     if mode == "v1":
-        return SYSTEM_PROMPT.replace(_NORMES_RULE_BASELINE, _NORMES_RULE_V1).replace(
-            _ORDER_LINE_BASELINE, _ORDER_LINE_V1
+        return _v1_answer_rules(
+            SYSTEM_PROMPT.replace(_NORMES_RULE_BASELINE, _NORMES_RULE_V1).replace(
+                _ORDER_LINE_BASELINE, _ORDER_LINE_V1
+            )
         )
     return SYSTEM_PROMPT
 
