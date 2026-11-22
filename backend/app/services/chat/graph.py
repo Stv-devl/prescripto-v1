@@ -45,13 +45,16 @@ from app.schemas.search import SearchFilters, SearchResult
 from app.services import project as project_service
 from app.services import search as search_service
 from app.services.chat import conversation as conversation_mod
+from app.services.chat import llm
 from app.services.chat.chunk_enrichment import enrich_with_dpgf_quantities, expand_heading_chunks
 from app.services.chat.context_budget import render_context_parts, select_by_score
 from app.services.chat.context_dedup import render_merged_context
 from app.services.chat.context_enrichment import build_db_context
 from app.services.chat.model_routing import (
+    LARGE_MODEL,
     Price,
     cached_tokens_of,
+    effective_model,
     input_cost_usd,
     price_for,
     prompt_cache_key,
@@ -170,6 +173,7 @@ def _usage_event(
     short_call_price: Price | None = None,
     rewrite_price: Price | None = None,
     extraction: list[tuple[str, UsageInfo]] | None = None,
+    generation_price: Price | None = None,
 ) -> dict[str, object]:
     """Build the {rewrite, generation, [agent,] [extraction,] total} usage payload for the SSE stream.
 
@@ -182,7 +186,9 @@ def _usage_event(
     short_price = short_call_price or MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
     legs: dict[str, dict[str, int | float]] = {
         "rewrite": _usage_leg(rewrite, rewrite_price or short_price),
-        "generation": _usage_leg(generation),
+        "generation": _usage_leg(
+            generation, generation_price or MISTRAL_LARGE_PRICE_USD_PER_1M_TOKENS
+        ),
     }
     if agent is not None:
         legs["agent"] = _sum_legs([_usage_leg(usage, short_price) for usage in agent])
@@ -649,19 +655,18 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
             full_response = ""
             generation_usage: UsageInfo | None = None
 
-            cache_key = prompt_cache_key(settings.retrieval_mode, "generation")
-            cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
-            await mistral_large_limiter.wait()
+            await llm.wait_turn(mistral_large_limiter)
             generation_started = time.perf_counter()
             first_token_at: float | None = None
-            stream = await mistral_client.chat.stream_async(
-                model="mistral-large-latest",
+            pieces = llm.open_stream(
+                mistral_client,
+                model=LARGE_MODEL,
                 messages=state["mistral_messages"],
                 temperature=0.1,
-                **cache_kwargs,
+                cache_key=prompt_cache_key(settings.retrieval_mode, "generation"),
             )
-            async for event in stream:
-                token = event.data.choices[0].delta.content
+            async for piece in pieces:
+                token = piece.text
                 if token:
                     if first_token_at is None:
                         first_token_at = time.perf_counter()
@@ -670,8 +675,8 @@ def _build_graph(*, db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUI
                         )
                     full_response += token
                     writer({"text": token})
-                if event.data.usage is not None:
-                    generation_usage = event.data.usage
+                if piece.usage is not None:
+                    generation_usage = piece.usage
 
             if first_token_at is not None:
                 timing.record(GENERATE_STREAM, _elapsed_ms(first_token_at))
@@ -961,18 +966,28 @@ def _question_usage(values: Mapping[str, object]) -> dict[str, object]:
     ]
     agent_usage: list[UsageInfo] | None = None
     short_call_price: Price | None = None
-    rewrite_price: Price | None = None
-    if settings.retrieval_mode == "v1":
+    mode = settings.retrieval_mode
+    if mode == "v1":
         agent_usage = values.get("agent_usage") or []  # type: ignore[assignment]
-        short_call_price = price_for(short_call_model("v1", settings.v1_fast_model))
-        rewrite_price = price_for(short_call_model("v1", settings.v1_rewrite_model))
+        short_call_price = price_for(_reached(short_call_model("v1", settings.v1_fast_model)))
     return _usage_event(
         values.get("rewrite_usage"),  # type: ignore[arg-type]
         values.get("generation_usage"),  # type: ignore[arg-type]
         agent_usage,
         short_call_price=short_call_price,
-        rewrite_price=rewrite_price,
+        rewrite_price=price_for(_reached(short_call_model(mode, settings.v1_rewrite_model))),
         extraction=extraction,
+        generation_price=price_for(_reached(LARGE_MODEL)),
+    )
+
+
+def _reached(model: str) -> str:
+    """The model a chat call for `model` actually reaches under the configured provider."""
+    return effective_model(
+        settings.chat_provider,
+        model,
+        chat_model=settings.openai_chat_model,
+        fast_model=settings.openai_fast_model,
     )
 
 
@@ -1003,6 +1018,7 @@ def _log_question(
             ttft_ms=ttft_ms,
             failed=failed,
             timings=step_fields(entries),
+            llm={"llm_provider": settings.chat_provider, "llm_model": _reached(LARGE_MODEL)},
         )
         question_logger.info(json.dumps(record))
     except Exception:

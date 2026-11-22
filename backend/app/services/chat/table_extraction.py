@@ -9,6 +9,7 @@ from mistralai.client.models import UsageInfo
 
 from app.core.mistral import mistral_client, mistral_large_limiter
 from app.schemas.chat import StructuredTable
+from app.services.chat import llm
 from app.services.chat.model_routing import LARGE_MODEL
 from app.services.chat.prompts import TABLE_EXTRACTION_PROMPT
 
@@ -137,8 +138,9 @@ async def extract_table(
             f"{len(context_lines)} lines (truncated={len(reordered) > TABLE_CONTEXT_LIMIT})"
         )
 
-        await mistral_large_limiter.wait()
-        response = await mistral_client.chat.complete_async(
+        reply = await llm.complete(
+            mistral_client,
+            mistral_large_limiter,
             model=model,
             messages=[
                 {"role": "system", "content": TABLE_EXTRACTION_PROMPT},
@@ -151,11 +153,11 @@ async def extract_table(
             ],
             temperature=0.0,
             max_tokens=800,
-            response_format={"type": "json_object"},
+            json_mode=True,
         )
-        if usage_sink is not None and response.usage is not None:
-            usage_sink.append((model, response.usage))
-        raw = response.choices[0].message.content  # type: ignore[union-attr]
+        if usage_sink is not None and reply.usage is not None:
+            usage_sink.append((reply.model, reply.usage))
+        raw = reply.text
         logger.debug(f"[TABLE DEBUG] Raw LLM response: {len(raw) if raw else 0} chars")
         if not raw:
             return None

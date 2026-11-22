@@ -652,3 +652,71 @@ async def test_duplicate_passages_are_returned_once(
 
     assert [r.text for r in outcome.results] == [TEXT_ONE]
     assert outcome.calls_made == 2
+
+
+async def test_b27_retry_on_openai_executes_the_openai_tool_calls(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openai.types import CompletionUsage
+    from openai.types.completion_usage import PromptTokensDetails
+
+    from app.core.config import settings
+
+    a1 = await _project(db, tenant_a)
+    store = FakeQdrant(
+        [
+            _chunk(1, tenant=tenant_a, project=a1, text=TEXT_ONE),
+            _chunk(2, tenant=tenant_a, project=a1, text=TEXT_TWO),
+        ]
+    )
+    openai_calls: list[dict[str, object]] = []
+    reply = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[_search("c1", "béton"), _search("c2", "cloisons")],
+                )
+            )
+        ],
+        usage=CompletionUsage(
+            prompt_tokens=321,
+            completion_tokens=17,
+            total_tokens=338,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=64),
+        ),
+    )
+
+    async def create(**kwargs: object) -> SimpleNamespace:
+        openai_calls.append(kwargs)
+        return reply
+
+    fake_openai = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    forbidden = _install_mistral(monkeypatch, [_search("m1", "MISTRAL_MUST_NOT_BE_CALLED")])
+    monkeypatch.setattr(settings, "openai_api_key", "sk-test")
+    monkeypatch.setattr(settings, "chat_provider", "openai")
+    monkeypatch.setattr(settings, "openai_chat_model", "gpt-test-chat")
+    monkeypatch.setattr(settings, "openai_fast_model", "gpt-test-fast")
+    monkeypatch.setattr(settings, "openai_reasoning_effort", None)
+    monkeypatch.setattr(settings, "retrieval_mode", "v1")
+    monkeypatch.setattr(settings, "v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.services.chat.llm.get_openai_client", lambda: fake_openai)
+    usage_sink: list[UsageInfo] = []
+
+    with (
+        patch("app.services.search.qdrant_client", store),
+        patch("app.services.search.embed_texts", AsyncMock(return_value=[[0.1] * 8])),
+    ):
+        async with _real_session(db, ToolIdentity(tenant_id=tenant_a.id)) as session:
+            outcome = await retry_with_tools(
+                QUESTION, MISSING, project_id=a1.id, session=session, usage_sink=usage_sink
+            )
+
+    assert {r.text for r in outcome.results} == {TEXT_ONE, TEXT_TWO}
+    assert outcome.queries == ["béton", "cloisons"]
+    assert outcome.calls_made == 2
+    assert forbidden.await_count == 0
+    assert len(openai_calls) == 1
+    assert openai_calls[0]["tool_choice"] == "required"
+    assert len(usage_sink) == 1
+    assert usage_sink[0].prompt_tokens == 321

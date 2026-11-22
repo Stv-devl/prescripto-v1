@@ -181,3 +181,73 @@ def test_cached_tokens_of_is_clamped_to_prompt_tokens() -> None:
         }
     )
     assert cached_tokens_of(usage) == 100
+
+
+def test_b18_effective_model_on_mistral_is_the_requested_model() -> None:
+    from app.services.chat.model_routing import effective_model
+
+    assert (
+        effective_model(
+            "mistral",
+            "mistral-large-latest",
+            chat_model="gpt-test-chat",
+            fast_model="gpt-test-fast",
+        )
+        == "mistral-large-latest"
+    )
+    assert (
+        effective_model(
+            "mistral",
+            "mistral-small-latest",
+            chat_model="gpt-test-chat",
+            fast_model="gpt-test-fast",
+        )
+        == "mistral-small-latest"
+    )
+
+
+def test_b19_effective_model_on_openai_maps_large_to_chat_and_others_to_fast() -> None:
+    from app.services.chat.model_routing import effective_model
+
+    assert (
+        effective_model(
+            "openai",
+            "mistral-large-latest",
+            chat_model="gpt-test-chat",
+            fast_model="gpt-test-fast",
+        )
+        == "gpt-test-chat"
+    )
+    assert (
+        effective_model(
+            "openai",
+            "mistral-small-latest",
+            chat_model="gpt-test-chat",
+            fast_model="gpt-test-fast",
+        )
+        == "gpt-test-fast"
+    )
+
+
+def test_b20_openai_candidate_prices_are_the_published_ones() -> None:
+    from app.services.chat.model_routing import price_for
+
+    assert price_for("gpt-5.6-luna") == {"input": 0.20, "cached_input": 0.02, "output": 1.20}
+    assert price_for("gpt-5.4-mini") == {"input": 0.75, "cached_input": 0.075, "output": 4.50}
+    assert price_for("gpt-4o-mini") == {"input": 0.15, "cached_input": 0.075, "output": 0.60}
+
+
+def test_b21_input_cost_uses_an_explicit_cached_input_price() -> None:
+    import pytest
+
+    from app.services.chat.model_routing import input_cost_usd, price_for
+
+    assert input_cost_usd(1_000, 400, price_for("gpt-4o-mini")) == pytest.approx(0.00012)
+
+
+def test_b22_input_cost_without_cached_input_keeps_the_ratio() -> None:
+    import pytest
+
+    from app.services.chat.model_routing import input_cost_usd, price_for
+
+    assert input_cost_usd(1_000, 400, price_for("mistral-large-latest")) == pytest.approx(0.00032)

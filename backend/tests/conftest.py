@@ -59,8 +59,9 @@ def _fast_mistral_limiter() -> Iterator[None]:
     the suite takes minutes instead of seconds.
     """
     from app.core.mistral import mistral_fast_limiter, mistral_large_limiter
+    from app.core.openai import openai_limiter
 
-    limiters = (mistral_large_limiter, mistral_fast_limiter)
+    limiters = (mistral_large_limiter, mistral_fast_limiter, openai_limiter)
     original_intervals = [limiter._min_interval for limiter in limiters]
     for limiter in limiters:
         limiter._min_interval = 0.0

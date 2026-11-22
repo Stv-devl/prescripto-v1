@@ -273,3 +273,35 @@ class TestOpenAIKey:
     ) -> None:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         assert Settings(_env_file=None, **_BASE).openai_api_key is None  # type: ignore[call-arg]
+
+
+class TestChatProvider:
+    def test_the_chat_provider_defaults_to_mistral(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CHAT_PROVIDER", raising=False)
+        assert Settings(_env_file=None, **_BASE).chat_provider == "mistral"  # type: ignore[call-arg]
+
+    def test_openai_without_a_key_refuses_to_boot_naming_only_the_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValidationError) as raised:
+            Settings(_env_file=None, **{**_BASE, "chat_provider": "openai"})  # type: ignore[call-arg]
+
+        message = str(raised.value)
+        assert "OPENAI_API_KEY is required when CHAT_PROVIDER=openai" in message
+        for secret in (_BASE["jwt_secret_key"], _BASE["mistral_api_key"]):
+            assert str(secret) not in message
+
+    def test_openai_with_a_key_boots(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        configured = Settings(  # type: ignore[call-arg]
+            _env_file=None, **{**_BASE, "chat_provider": "openai", "openai_api_key": "sk-test"}
+        )
+        assert configured.chat_provider == "openai"
+
+    def test_the_default_openai_models_have_a_price(self) -> None:
+        from app.services.chat.model_routing import MODEL_PRICES
+
+        defaults = Settings(_env_file=None, **_BASE)  # type: ignore[call-arg]
+        assert defaults.openai_chat_model in MODEL_PRICES
+        assert defaults.openai_fast_model in MODEL_PRICES

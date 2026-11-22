@@ -296,3 +296,21 @@ def test_record_rejects_a_timing_key_that_shadows_a_contract_key() -> None:
 
     with pytest.raises(ValueError):
         _build_timed({"latency_ms": 5})
+
+
+def test_b23_record_carries_llm_provider_and_model_when_given() -> None:
+    record = build_question_record(
+        state={"context_block": "ctx"},
+        usage=V1_USAGE,
+        mode="v1",
+        tenant_id=TENANT,
+        conversation_id=CONVERSATION,
+        latency_ms=5230,
+        ttft_ms=1840,
+        failed=False,
+        llm={"llm_provider": "openai", "llm_model": "gpt-test-chat"},
+    )
+
+    assert record["llm_provider"] == "openai"
+    assert record["llm_model"] == "gpt-test-chat"
+    assert set(record) == CONTRACT_KEYS | {"llm_provider", "llm_model"}

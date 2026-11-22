@@ -470,3 +470,59 @@ async def test_baseline_judge_and_reformulation_send_no_cache_key_argument(
     await reformulate("Quelle epaisseur ?", "les cotes", first_query="epaisseur", usage_sink=[])
     assert "prompt_cache_key" not in judge_complete.call_args.kwargs
     assert "prompt_cache_key" not in reformulate_complete.call_args.kwargs
+
+
+async def test_b26_judge_on_openai_parses_the_openai_judgment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openai.types import CompletionUsage
+    from openai.types.completion_usage import PromptTokensDetails
+
+    from app.core.config import settings
+
+    calls: list[dict[str, object]] = []
+    reply = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"verdict": "insuffisant", "manque": "les cotes"}', tool_calls=None
+                )
+            )
+        ],
+        usage=CompletionUsage(
+            prompt_tokens=321,
+            completion_tokens=17,
+            total_tokens=338,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=64),
+        ),
+    )
+
+    async def create(**kwargs: object) -> SimpleNamespace:
+        calls.append(kwargs)
+        return reply
+
+    fake_openai = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    forbidden = _install_mistral(monkeypatch, "MISTRAL_MUST_NOT_BE_CALLED", _usage())
+    monkeypatch.setattr(settings, "openai_api_key", "sk-test")
+    monkeypatch.setattr(settings, "chat_provider", "openai")
+    monkeypatch.setattr(settings, "openai_chat_model", "gpt-test-chat")
+    monkeypatch.setattr(settings, "openai_fast_model", "gpt-test-fast")
+    monkeypatch.setattr(settings, "openai_reasoning_effort", None)
+    monkeypatch.setattr(settings, "retrieval_mode", "v1")
+    monkeypatch.setattr(settings, "v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr("app.services.chat.llm.get_openai_client", lambda: fake_openai)
+    sink: list[UsageInfo] = []
+
+    judgment = await judge_sufficiency(
+        "Quelle est la cote du fond de fouille ?",
+        "[cctp.pdf, p.2]\nTerrassement general",
+        usage_sink=sink,
+    )
+
+    assert judgment == Judgment(False, "les cotes")
+    assert len(calls) == 1
+    assert calls[0]["model"] == "gpt-test-fast"
+    assert forbidden.await_count == 0
+    assert len(sink) == 1
+    assert sink[0].prompt_tokens == 321
+    assert sink[0].completion_tokens == 17

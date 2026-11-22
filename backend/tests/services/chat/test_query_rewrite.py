@@ -465,3 +465,87 @@ async def test_v1_rewrite_messages_start_with_the_rewrite_prompt_as_system(
         {"role": "user", "content": "Quels sont les lots ?"},
         {"role": "assistant", "content": "Gros oeuvre et couverture."},
     ]
+
+
+class _FakeOpenAI:
+    def __init__(self, content: str | None = None, error: Exception | None = None) -> None:
+        from openai.types import CompletionUsage
+        from openai.types.completion_usage import PromptTokensDetails
+
+        self.calls: list[dict[str, object]] = []
+        self._error = error
+        self._reply = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))],
+            usage=CompletionUsage(
+                prompt_tokens=321,
+                completion_tokens=17,
+                total_tokens=338,
+                prompt_tokens_details=PromptTokensDetails(cached_tokens=64),
+            ),
+        )
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kwargs: object) -> SimpleNamespace:
+        self.calls.append(kwargs)
+        if self._error is not None:
+            raise self._error
+        return self._reply
+
+
+def _install_openai_provider(monkeypatch: pytest.MonkeyPatch, fake: _FakeOpenAI) -> SimpleNamespace:
+    forbidden = _fake_mistral("MISTRAL_MUST_NOT_BE_CALLED")
+    monkeypatch.setattr(settings, "openai_api_key", "sk-test")
+    monkeypatch.setattr(settings, "chat_provider", "openai")
+    monkeypatch.setattr(settings, "openai_chat_model", "gpt-test-chat")
+    monkeypatch.setattr(settings, "openai_fast_model", "gpt-test-fast")
+    monkeypatch.setattr(settings, "openai_reasoning_effort", None)
+    monkeypatch.setattr(settings, "retrieval_mode", "v1")
+    monkeypatch.setattr(settings, "v1_rewrite_model", "mistral-small-latest")
+    monkeypatch.setattr("app.services.chat.llm.get_openai_client", lambda: fake)
+    monkeypatch.setattr("app.services.chat.query_rewrite.mistral_client", forbidden)
+    return forbidden
+
+
+async def test_b24_rewrite_on_openai_uses_the_openai_reply_as_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    openai = _FakeOpenAI(content=NORMAL_JSON)
+    mistral = _install_openai_provider(monkeypatch, openai)
+    sink: list[object] = []
+
+    result = await rewrite_query(PLAIN_QUESTION, [], usage_sink=sink)  # type: ignore[arg-type]
+
+    assert result == (
+        "DTU 20.1 qualité maçonneries",
+        ["exécution maçonnerie"],
+        "specific",
+        "none",
+        "none",
+    )
+    assert len(openai.calls) == 1
+    assert openai.calls[0]["model"] == "gpt-test-fast"
+    assert mistral.chat.complete_async.await_count == 0
+    assert len(sink) == 1
+    assert sink[0].prompt_tokens == 321  # type: ignore[attr-defined]
+    assert sink[0].completion_tokens == 17  # type: ignore[attr-defined]
+
+
+async def test_b25_rewrite_on_openai_error_falls_back_to_the_original_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    openai = _FakeOpenAI(error=RuntimeError("429 rate limited"))
+    mistral = _install_openai_provider(monkeypatch, openai)
+    sink: list[object] = []
+
+    result = await rewrite_query(PLAIN_QUESTION, [], usage_sink=sink)  # type: ignore[arg-type]
+
+    assert result == (
+        "Combien de fenêtres en façade ?",
+        [],
+        "specific",
+        "none",
+        "none",
+    )
+    assert len(openai.calls) == 1
+    assert mistral.chat.complete_async.await_count == 0
+    assert sink == []

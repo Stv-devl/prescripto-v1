@@ -146,3 +146,47 @@ async def test_mistral_error_returns_none_without_raising(monkeypatch: pytest.Mo
 
     assert table is None
     assert sink == []
+
+
+async def test_b28_table_on_openai_is_parsed_and_usage_names_the_openai_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openai.types import CompletionUsage
+    from openai.types.completion_usage import PromptTokensDetails
+
+    openai_calls: list[dict[str, object]] = []
+    reply = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=_table_json(), tool_calls=None))],
+        usage=CompletionUsage(
+            prompt_tokens=321,
+            completion_tokens=17,
+            total_tokens=338,
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=64),
+        ),
+    )
+
+    async def create(**kwargs: object) -> SimpleNamespace:
+        openai_calls.append(kwargs)
+        return reply
+
+    fake_openai = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    sink: list[tuple[str, UsageInfo]] = []
+    with _doubles(monkeypatch, mode="v1") as trace:
+        monkeypatch.setattr(settings, "openai_api_key", "sk-test")
+        monkeypatch.setattr(settings, "chat_provider", "openai")
+        monkeypatch.setattr(settings, "openai_chat_model", "gpt-test-chat")
+        monkeypatch.setattr(settings, "openai_fast_model", "gpt-test-fast")
+        monkeypatch.setattr(settings, "openai_reasoning_effort", None)
+        monkeypatch.setattr("app.services.chat.llm.get_openai_client", lambda: fake_openai)
+        table = await extract_table(CONTEXT, QUESTION, usage_sink=sink)
+
+    assert table == StructuredTable(title="Semelles", columns=COLUMNS, rows=ROWS)
+    assert len(openai_calls) == 1
+    assert openai_calls[0]["model"] == "gpt-test-chat"
+    assert openai_calls[0]["response_format"] == {"type": "json_object"}
+    assert trace.models == []
+    assert (trace.large_waits, trace.fast_waits) == (0, 0)
+    assert len(sink) == 1
+    assert sink[0][0] == "gpt-test-chat"
+    assert sink[0][1].prompt_tokens == 321
+    assert sink[0][1].completion_tokens == 17

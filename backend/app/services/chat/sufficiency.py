@@ -12,6 +12,7 @@ from mistralai.client.models import UsageInfo
 from app.core.config import settings
 from app.core.mistral import mistral_client, mistral_fast_limiter, mistral_large_limiter
 from app.schemas.search import SearchResult
+from app.services.chat import llm
 from app.services.chat.model_routing import (
     PromptName,
     is_large,
@@ -148,20 +149,18 @@ async def _complete(
 ) -> str | None:
     model = short_call_model(settings.retrieval_mode, settings.v1_fast_model)
     limiter = mistral_large_limiter if is_large(model) else mistral_fast_limiter
-    cache_key = prompt_cache_key(settings.retrieval_mode, prompt)
-    cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
-    await limiter.wait()
-    response = await mistral_client.chat.complete_async(
+    reply = await llm.complete(
+        mistral_client,
+        limiter,
         model=model,
         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.0,
         max_tokens=150,
-        **cache_kwargs,
+        cache_key=prompt_cache_key(settings.retrieval_mode, prompt),
     )
-    if response.usage is not None:
-        usage_sink.append(response.usage)
-    content = response.choices[0].message.content  # type: ignore[union-attr]
-    return content if isinstance(content, str) else None
+    if reply.usage is not None:
+        usage_sink.append(reply.usage)
+    return reply.text
 
 
 async def judge_sufficiency(
