@@ -1,7 +1,7 @@
 # Data model
 
 PostgreSQL 16, SQLAlchemy 2.0 async, Alembic migrations (`backend/alembic/`,
-15 revisions as of this writing). `TenantMixin` adds an indexed, cascading
+16 revisions as of this writing). `TenantMixin` adds an indexed, cascading
 `tenant_id` FK; `TimestampMixin` adds `created_at`/`updated_at` with
 server-side defaults.
 
@@ -14,7 +14,7 @@ server-side defaults.
 | Project | `projects` | yes (`TenantMixin`) | `name`, `phase`, `status`, `address`, `client`, `architect`, project-team names and addresses, `is_favorite` |
 | Folder | `folders` | no — via `project_id` | `name`, `lot`, `phase` |
 | Document | `documents` | no — via `project_id` | `filename`, `type`, `lot`, `phase`, `status`, `chunk_count`, `ingested_at` |
-| Chunk | `chunks` | no — via `document_id` | text, page, position, `qdrant_point_id`, keywords, section metadata |
+| Chunk | `chunks` | no — via `document_id` | text, page, position, `qdrant_point_id`, `lot` (the chunk's own lot, falling back to the document's — see [`ingestion-pipeline.md`](./ingestion-pipeline.md#chunking)), keywords, section metadata |
 | ProjectSummary | `project_summaries` | no — via `project_id` (unique) | `status`, `data_json`, `error_message`, `generated_at` |
 | Conversation | `conversations` | no — via `project_id` | `title` |
 | Message | `messages` | no — via `conversation_id` | `role`, `content`, `sources_json`, `structured_json`, `schema_json` |

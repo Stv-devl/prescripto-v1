@@ -65,6 +65,17 @@ regex patterns for materials, standards (DTU, NF, Eurocodes), performance
 values, and building locations — so the retrieval side can filter or boost
 on more than embedding similarity alone.
 
+In article-split documents each chunk also gets its own lot (`chunk_lot`).
+`LOT_LINE_RE` in `chunking.py` recognises CCTP lot lines (`LOT N°01 - X`,
+`Lot n° 2. X`, `Lot n°2 X`): it needs the complete number and a title starting
+with an uppercase letter. A chunk takes the lot of the last lot line at or
+before its start, in the `NN - TITLE` form. The pipeline writes that chunk lot,
+or the document's classified lot when there is none (and for every other
+chunker), to the `chunks.lot` column and to the Qdrant payload `lot`. A
+multi-lot CCTP therefore has its chunks spread over its lots instead of all
+carrying the document's lot. Documents ingested before this change keep the
+document-level lot until they are re-ingested.
+
 ## Embedding & storage
 
 `mistral-embed`, 1024 dimensions, batched 10 chunks per call with retry on

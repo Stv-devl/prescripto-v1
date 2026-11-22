@@ -31,6 +31,7 @@ CHUNK_OVERLAP = 300
 MIN_CHUNK_SIZE = 250
 
 LOT_RE = re.compile(r"^\s*(?:LOT|Lot)\s*[Nn°]*\s*(\d+)\s*[-–:.]\s*(.+)", re.IGNORECASE)
+LOT_LINE_RE = re.compile(r"^\s*(?i:lot\s*n?)\s*°?\s*(\d+)(?!\d)\s*[-–:.]?\s*([A-ZÀ-ÖØ-Þ].*?)\s*$")
 ARTICLE_RE = re.compile(
     r"^\s*(?:Art(?:icle)?\.?\s+)?(\d+)[.\-](\d+)\s*[-–:.]\s*(.+)", re.IGNORECASE
 )
@@ -163,6 +164,28 @@ def _detect_heading_level(line: str) -> tuple[int, str] | None:
     return None
 
 
+def _lot_of_line(line: str) -> str:
+    """Return `NN - TITLE` when the line is a lot line (`Lot n°2 CHARPENTE`, `LOT N°01 - X`), else ''."""
+    m = LOT_LINE_RE.match(line)
+    if not m:
+        return ""
+    return f"{m.group(1).zfill(2)} - {m.group(2)}"
+
+
+def _lot_at_start(text: str, current_lot: str) -> str:
+    """Lot in effect at the start of a chunk: its own first line if it is a lot line."""
+    return _lot_of_line(text.split("\n", 1)[0]) or current_lot
+
+
+def _lot_after(text: str, current_lot: str) -> str:
+    """Lot in effect after a chunk: the last lot line inside it, else unchanged."""
+    for line in reversed(text.split("\n")):
+        lot = _lot_of_line(line)
+        if lot:
+            return lot
+    return current_lot
+
+
 def _update_heading_stack(stack: list[str], level: int, heading: str) -> list[str]:
     """Update heading stack: truncate to level and append new heading."""
     new_stack = stack[:level]
@@ -255,10 +278,6 @@ def chunk_by_articles(pages: list[ExtractedPage]) -> list[TextChunk]:
         if heading_info is not None:
             level, heading_text = heading_info
             heading_stack = _update_heading_stack(heading_stack, level, heading_text)
-            if level == 0:
-                m = LOT_RE.match(first_line)
-                if m:
-                    current_lot = f"{m.group(1).zfill(2)} - {m.group(2).strip()}"
 
         parent_sections = list(heading_stack)
         section_title = heading_stack[-1] if heading_stack else ""
@@ -276,13 +295,14 @@ def chunk_by_articles(pages: list[ExtractedPage]) -> list[TextChunk]:
                     parent_sections=parent_sections,
                     section_title=section_title,
                     heading_prefix=heading_prefix,
-                    chunk_lot=current_lot,
+                    chunk_lot=_lot_at_start(section, current_lot),
                     content_type=content_type,
                     keywords=keywords,
                     localisation=localisation,
                     char_count=len(section),
                 )
             )
+            current_lot = _lot_after(section, current_lot)
         else:
             sub_chunks = _split_preserving_tables(section)
             for j, sub in enumerate(sub_chunks):
@@ -294,13 +314,14 @@ def chunk_by_articles(pages: list[ExtractedPage]) -> list[TextChunk]:
                         parent_sections=parent_sections,
                         section_title=section_title,
                         heading_prefix=heading_prefix,
-                        chunk_lot=current_lot,
+                        chunk_lot=_lot_at_start(sub, current_lot),
                         content_type=_classify_content_type(sub),
                         keywords=_extract_keywords(sub),
                         localisation=_extract_localisation(sub),
                         char_count=len(sub),
                     )
                 )
+                current_lot = _lot_after(sub, current_lot)
 
     return chunks if chunks else chunk_by_paragraphs(pages)
 

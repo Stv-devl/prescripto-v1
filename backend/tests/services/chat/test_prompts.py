@@ -189,21 +189,17 @@ class TestNormesBlockByMode:
 
         assert "DTU/NF EN applicables" not in system_prompt_for("v1")
 
-    def test_v1_system_prompt_differs_from_baseline_only_on_sentence_d_and_the_order_line(
-        self,
-    ) -> None:
+    def test_v1_system_prompt_keeps_the_baseline_rules_it_does_not_change(self) -> None:
         from app.services.chat.prompts import system_prompt_for
 
         baseline = system_prompt_for("baseline")
         v1 = system_prompt_for("v1")
-        assert "   d) " in baseline
-        assert "   ORDRE STRICT" in baseline
-        assert v1.split("   d) ")[0] == baseline.split("   d) ")[0]
-        assert v1[v1.index("   ORDRE STRICT"):] == (
-            "   ORDRE STRICT en fin de réponse : **Localisation**, puis **Normes** "
-            "UNIQUEMENT s'il y a au moins une norme à citer (règle d) — rien après. "
-            "Une réponse sans bloc Normes est correcte.\n"
-        ) + baseline[baseline.index("   Si plusieurs variantes"):]
+        for number in (1, 2, 3, 5, 8, 9, 10, 12):
+            start = baseline.index(f"\n{number}. ") + 1
+            next_marker = "13. " if number == 12 else f"\n{number + 1}. "
+            end = baseline.index(next_marker, start)
+            rule_text = baseline[start:end]
+            assert rule_text in v1, f"baseline rule {number} is not served unchanged by v1"
 
     def test_v1_system_prompt_still_forbids_signalling_an_absent_info(self) -> None:
         from app.services.chat.prompts import system_prompt_for
@@ -249,6 +245,61 @@ class TestNormesBlockByMode:
 
         assert get_ouvrage_instruction(self.NO_MATCH, "baseline") == ""
         assert get_ouvrage_instruction(self.NO_MATCH, "v1") == ""
+
+    def test_p1_v1_system_prompt_says_concise_does_not_mean_less_data(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "CONCIS ne veut PAS dire moins de données" in system_prompt_for("v1")
+
+    def test_p2_v1_system_prompt_forbids_a_single_word_yes_no_answer(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "jamais un mot seul" in system_prompt_for("v1")
+
+    def test_p3_v1_system_prompt_assigns_a_passage_to_the_lot_of_its_block(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "un passage appartient au lot du bloc où il se trouve" in system_prompt_for("v1")
+
+    def test_p4_v1_system_prompt_asks_for_all_the_requested_norms(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "cite-les TOUTES, chacune avec son objet" in system_prompt_for("v1")
+
+    def test_p5_v1_system_prompt_makes_the_bullet_list_mandatory(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "cette liste est OBLIGATOIRE" in system_prompt_for("v1")
+
+    def test_p5_v1_system_prompt_makes_the_normes_block_mandatory_when_a_norm_exists(
+        self,
+    ) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "le bloc **Normes** est OBLIGATOIRE" in system_prompt_for("v1")
+
+    def test_p6_v1_system_prompt_drops_the_final_validation_rule_the_baseline_keeps(
+        self,
+    ) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "VALIDATION FINALE" not in system_prompt_for("v1")
+        assert "VALIDATION FINALE" in system_prompt_for("baseline")
+
+    def test_p7_v1_system_prompt_replaces_the_long_localisation_block_by_one_line(
+        self,
+    ) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        v1 = system_prompt_for("v1")
+        assert "FORMAT FINAL UNIQUE" not in v1
+        assert "jamais au milieu, jamais après une variante" in v1
+
+    def test_p9_v1_system_prompt_forbids_copying_the_lot_separators(self) -> None:
+        from app.services.chat.prompts import system_prompt_for
+
+        assert "ne les recopie jamais dans la réponse" in system_prompt_for("v1")
+        assert "ne les recopie jamais dans la réponse" not in system_prompt_for("baseline")
 
 
 class TestNormesBlockOptionalInV1:

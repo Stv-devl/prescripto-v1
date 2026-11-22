@@ -10,6 +10,7 @@ from mistralai.client.models import UsageInfo
 
 from app.core.config import settings
 from app.core.mistral import mistral_client, mistral_fast_limiter, mistral_large_limiter
+from app.services.chat import llm
 from app.services.chat.model_routing import is_large, prompt_cache_key, short_call_model
 from app.services.chat.prompts import OFF_TOPIC, REWRITE_PROMPT
 from app.services.sparse import tokenize
@@ -74,18 +75,18 @@ async def rewrite_query(
         model = short_call_model(settings.retrieval_mode, settings.v1_rewrite_model)
         limiter = mistral_large_limiter if is_large(model) else mistral_fast_limiter
         cache_key = prompt_cache_key(settings.retrieval_mode, "rewrite")
-        cache_kwargs = {"prompt_cache_key": cache_key} if cache_key else {}
-        await limiter.wait()
-        response = await mistral_client.chat.complete_async(
+        reply = await llm.complete(
+            mistral_client,
+            limiter,
             model=model,
             messages=messages,
             temperature=0.0,
             max_tokens=300,
-            **cache_kwargs,
+            cache_key=cache_key,
         )
         if usage_sink is not None:
-            usage_sink.append(response.usage)
-        rewritten = response.choices[0].message.content  # type: ignore[union-attr]
+            usage_sink.append(reply.usage)  # type: ignore[arg-type]
+        rewritten = reply.text
         if rewritten and rewritten.strip():
             cleaned = rewritten.strip()
             if OFF_TOPIC in cleaned:

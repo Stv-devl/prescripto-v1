@@ -11,6 +11,7 @@ from app.core.mistral import mistral_client, mistral_large_limiter
 from app.schemas.chat import StructuredSchema
 from app.schemas.search import SearchFilters
 from app.services import search as search_service
+from app.services.chat import llm
 from app.services.chat.model_routing import LARGE_MODEL
 from app.services.chat.prompts import (
     SCHEMA_EXTRACTION_PROMPT,
@@ -79,8 +80,9 @@ async def extract_schema(
     usage_sink, when given, receives (model called, token usage) for the call."""
     model = LARGE_MODEL
     try:
-        await mistral_large_limiter.wait()
-        response = await mistral_client.chat.complete_async(
+        reply = await llm.complete(
+            mistral_client,
+            mistral_large_limiter,
             model=model,
             messages=[
                 {"role": "system", "content": SCHEMA_EXTRACTION_PROMPT},
@@ -93,11 +95,11 @@ async def extract_schema(
             ],
             temperature=0.0,
             max_tokens=800,
-            response_format={"type": "json_object"},
+            json_mode=True,
         )
-        if usage_sink is not None and response.usage is not None:
-            usage_sink.append((model, response.usage))
-        raw = response.choices[0].message.content  # type: ignore[union-attr]
+        if usage_sink is not None and reply.usage is not None:
+            usage_sink.append((reply.model, reply.usage))
+        raw = reply.text
         if not raw:
             logger.debug("[SCHEMA DEBUG] LLM returned empty response")
             return None

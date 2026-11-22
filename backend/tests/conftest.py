@@ -16,6 +16,10 @@ os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-key-32-characters-min")
 # the suite silently depends on a developer's own .env: it runs here and dies at
 # collection on a fresh checkout, and on CI. The tests never reach Mistral.
 os.environ.setdefault("MISTRAL_API_KEY", "test-mistral-key-never-called")
+# Forced, not setdefault: the frozen Mistral-path tests rely on the mistral default, and an
+# exported CHAT_PROVIDER=openai (eval runs, prod switch) would send their prompts to the real
+# OpenAI API with the real key. OpenAI cases set `settings.chat_provider` themselves.
+os.environ["CHAT_PROVIDER"] = "mistral"
 
 import fitz  # noqa: E402
 import pytest  # noqa: E402
@@ -59,8 +63,9 @@ def _fast_mistral_limiter() -> Iterator[None]:
     the suite takes minutes instead of seconds.
     """
     from app.core.mistral import mistral_fast_limiter, mistral_large_limiter
+    from app.core.openai import openai_limiter
 
-    limiters = (mistral_large_limiter, mistral_fast_limiter)
+    limiters = (mistral_large_limiter, mistral_fast_limiter, openai_limiter)
     original_intervals = [limiter._min_interval for limiter in limiters]
     for limiter in limiters:
         limiter._min_interval = 0.0

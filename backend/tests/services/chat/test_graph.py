@@ -1532,3 +1532,206 @@ async def test_client_sse_events_are_unchanged_by_the_logging(
         "usage",
         "DONE",
     ]
+
+
+import pytest  # noqa: E402
+
+
+def _pin_chat_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider: str,
+    mode: str,
+    chat_model: str = "gpt-5.6-luna",
+    fast_model: str = "gpt-4o-mini",
+) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "openai_api_key", "sk-test")
+    monkeypatch.setattr(settings, "chat_provider", provider)
+    monkeypatch.setattr(settings, "retrieval_mode", mode)
+    monkeypatch.setattr(settings, "v1_rewrite_model", "mistral-large-latest")
+    monkeypatch.setattr(settings, "v1_fast_model", "mistral-small-latest")
+    monkeypatch.setattr(settings, "openai_chat_model", chat_model)
+    monkeypatch.setattr(settings, "openai_fast_model", fast_model)
+    monkeypatch.setattr(settings, "openai_reasoning_effort", None)
+
+
+class _FakeOpenAIChat:
+    """Answers the rewrite with a non-stream reply and the generation with a stream."""
+
+    def __init__(self, *, stream_error: Exception | None = None) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._stream_error = stream_error
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kwargs: object) -> object:
+        from openai.types import CompletionUsage
+        from openai.types.completion_usage import PromptTokensDetails
+
+        self.calls.append(kwargs)
+        if kwargs.get("stream"):
+            if self._stream_error is not None:
+                raise self._stream_error
+            return self._stream()
+        content = json.dumps({"query": QUESTION, "related": [], "structured": "none", "schema": "none"})
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None))],
+            usage=CompletionUsage(
+                prompt_tokens=10,
+                completion_tokens=5,
+                total_tokens=15,
+                prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
+            ),
+        )
+
+    async def _stream(self) -> object:
+        from openai.types import CompletionUsage
+        from openai.types.completion_usage import PromptTokensDetails
+
+        for token in STREAM_TOKENS:
+            yield SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content=token))], usage=None
+            )
+        yield SimpleNamespace(
+            choices=[],
+            usage=CompletionUsage(
+                prompt_tokens=1000,
+                completion_tokens=100,
+                total_tokens=1100,
+                prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
+            ),
+        )
+
+
+async def _openai_question(
+    db: AsyncSession,
+    tenant: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+    fake: _FakeOpenAIChat,
+    calls: list[str],
+) -> tuple[list[dict[str, object] | str], AsyncMock]:
+    project, user = await _project_and_user(db, tenant)
+    qdrant = FakeQdrant(
+        [_chunk_point(tenant_id=tenant.id, project_id=project.id, text=MAIN_CHUNK_TEXT)]
+    )
+    monkeypatch.setattr("app.services.chat.llm.get_openai_client", lambda: fake)
+    with _patched_qdrant(qdrant), _patched_mistral(
+        rewrite_response=_rewrite_response(query="MISTRAL_MUST_NOT_BE_CALLED"),
+        complete_calls=calls,
+    ) as stream_mock:
+        events = await _stream(db, tenant_id=tenant.id, project_id=project.id, user_id=user.id)
+    return events, stream_mock
+
+
+async def test_b30_chat_stream_on_openai_streams_openai_tokens_and_prices_generation_at_the_openai_price(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.services.chat.question_log_capture import usage_event_of
+
+    _pin_chat_settings(monkeypatch, provider="openai", mode="baseline")
+    fake = _FakeOpenAIChat()
+    mistral_calls: list[str] = []
+
+    events, mistral_stream = await _openai_question(db, tenant_a, monkeypatch, fake, mistral_calls)
+
+    assert [e["text"] for e in events if _kind(e) == "text"] == list(STREAM_TOKENS)  # type: ignore[index]
+    assert usage_event_of(events)["generation"]["cost_usd"] == pytest.approx(0.00032)
+    assert [c["model"] for c in fake.calls] == ["gpt-5.6-luna", "gpt-5.6-luna"]
+    assert [bool(c.get("stream")) for c in fake.calls] == [False, True]
+    assert mistral_calls == []
+    assert mistral_stream.call_count == 0
+
+
+async def test_b31_openai_generation_error_logs_the_question_as_failed(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.services.chat.question_log_capture import parsed, question_records
+
+    _pin_chat_settings(monkeypatch, provider="openai", mode="baseline")
+    fake = _FakeOpenAIChat(stream_error=RuntimeError("OpenAI stream dropped"))
+
+    with question_records() as records, pytest.raises(RuntimeError, match="OpenAI stream dropped"):
+        await _openai_question(db, tenant_a, monkeypatch, fake, [])
+
+    assert len(records) == 1
+    assert parsed(records)[0]["outcome"] == "failed"
+
+
+async def test_b32_chat_question_record_names_the_mistral_provider_and_generation_model_by_default(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.services.chat.question_log_capture import parsed, question_records
+
+    _pin_chat_settings(monkeypatch, provider="mistral", mode="baseline")
+
+    with question_records() as records:
+        await _happy_path(db, tenant_a)
+
+    assert len(records) == 1
+    record = parsed(records)[0]
+    assert record["llm_provider"] == "mistral"
+    assert record["llm_model"] == "mistral-large-latest"
+
+
+async def test_b33_question_usage_on_openai_v1_prices_every_leg_at_its_openai_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.chat.graph import _question_usage
+
+    _pin_chat_settings(monkeypatch, provider="openai", mode="v1")
+    values = {
+        "rewrite_usage": UsageInfo(prompt_tokens=1000, completion_tokens=100, total_tokens=1100),
+        "agent_usage": [
+            UsageInfo.model_validate(
+                {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 50,
+                    "total_tokens": 1050,
+                    "prompt_tokens_details": {"cached_tokens": 400},
+                }
+            )
+        ],
+        "table_usage": [
+            ("gpt-5.6-luna", UsageInfo(prompt_tokens=2000, completion_tokens=200, total_tokens=2200))
+        ],
+        "generation_usage": UsageInfo(prompt_tokens=1000, completion_tokens=100, total_tokens=1100),
+    }
+
+    usage = _question_usage(values)
+
+    assert usage["rewrite"]["cost_usd"] == pytest.approx(0.00032)  # type: ignore[index]
+    assert usage["agent"]["cost_usd"] == pytest.approx(0.00015)  # type: ignore[index]
+    assert usage["extraction"]["cost_usd"] == pytest.approx(0.00064)  # type: ignore[index]
+    assert usage["generation"]["cost_usd"] == pytest.approx(0.00032)  # type: ignore[index]
+
+
+async def test_b34_question_usage_on_openai_baseline_prices_the_rewrite_at_the_openai_chat_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.chat.graph import _question_usage
+
+    _pin_chat_settings(monkeypatch, provider="openai", mode="baseline")
+    values = {
+        "rewrite_usage": UsageInfo(prompt_tokens=1000, completion_tokens=100, total_tokens=1100),
+    }
+
+    usage = _question_usage(values)
+
+    assert usage["rewrite"]["cost_usd"] == pytest.approx(0.00032)  # type: ignore[index]
+
+
+async def test_b35_chat_question_record_on_openai_names_the_openai_provider_and_chat_model(
+    db: AsyncSession, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.services.chat.question_log_capture import parsed, question_records
+
+    _pin_chat_settings(monkeypatch, provider="openai", mode="baseline")
+
+    with question_records() as records:
+        await _openai_question(db, tenant_a, monkeypatch, _FakeOpenAIChat(), [])
+
+    assert len(records) == 1
+    record = parsed(records)[0]
+    assert record["llm_provider"] == "openai"
+    assert record["llm_model"] == "gpt-5.6-luna"

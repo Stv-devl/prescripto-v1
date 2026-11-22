@@ -263,3 +263,139 @@ class TestChunkByArticlesEnrichment:
         # At least one chunk should have a heading_prefix with " > "
         prefixes = [c.heading_prefix for c in chunks if " > " in c.heading_prefix]
         assert len(prefixes) > 0
+
+
+def _lot_propagation_pages() -> list[ExtractedPage]:
+    return [
+        ExtractedPage(
+            text=(
+                "1.3.4.1. Protection des arases étanches\n"
+                "Les arases étanches sont protégées par un film polyéthylène "
+                "avant la mise en oeuvre de la maçonnerie, avec recouvrement "
+                "minimal de dix centimètres.\n\n"
+                "Lot n°1 TERRASSEMENT / GROS-OEUVRE"
+            ),
+            page=1,
+            source="test",
+        ),
+        ExtractedPage(
+            text=(
+                "1.5.3. Enduit d'imperméabilisation\n"
+                "L'enduit d'imperméabilisation est appliqué en deux couches "
+                "sur les parois enterrées, après nettoyage et humidification "
+                "préalable du support.\n\n"
+                "Lot n° 2. CHARPENTE BOIS"
+            ),
+            page=2,
+            source="test",
+        ),
+        ExtractedPage(
+            text=(
+                "2.2.1.7. Chevronnage\n"
+                "Les chevrons en sapin traité classe 2 sont fixés sur les "
+                "pannes par pointes annelées, avec un entraxe de quarante "
+                "centimètres maximum.\n\n"
+                "Lot n°2 CHARPENTE BOIS\n\n"
+                "Lot n° 4. MENUISERIE EXTERIEURE / SERRURERIE"
+            ),
+            page=3,
+            source="test",
+        ),
+        ExtractedPage(
+            text=(
+                "4.2.2.1. Trappe d'accès au vide-sanitaire\n"
+                "La trappe d'accès au vide-sanitaire est en aluminium laqué, "
+                "avec joint d'étanchéité périphérique et fermeture par "
+                "serrure à clé.\n\n"
+                "Lot n°4 MENUISERIE EXTERIEURE / SERRURERIE"
+            ),
+            page=4,
+            source="test",
+        ),
+    ]
+
+
+class TestChunkByArticlesLotPropagation:
+    def test_r1_chunk_after_separatorless_running_header_takes_that_lot(self) -> None:
+        chunks = chunk_by_articles(_lot_propagation_pages())
+        chunk = next(c for c in chunks if c.text.startswith("2.2.1.7."))
+        assert chunk.chunk_lot == "02 - CHARPENTE BOIS"
+
+    def test_r2_chunk_after_spaced_dotted_lot_line_takes_that_lot(self) -> None:
+        chunks = chunk_by_articles(_lot_propagation_pages())
+        chunk = next(c for c in chunks if c.text.startswith("4.2.2.1."))
+        assert chunk.chunk_lot == "04 - MENUISERIE EXTERIEURE / SERRURERIE"
+
+    def test_r3_chunk_ending_with_a_lot_line_does_not_take_it_backwards(self) -> None:
+        chunks = chunk_by_articles(_lot_propagation_pages())
+        chunk = next(c for c in chunks if c.text.startswith("1.3.4.1."))
+        assert chunk.chunk_lot == ""
+
+    def test_r4_chunk_takes_the_lot_of_the_previous_section_end_not_its_own(self) -> None:
+        chunks = chunk_by_articles(_lot_propagation_pages())
+        chunk = next(c for c in chunks if c.text.startswith("1.5.3."))
+        assert chunk.chunk_lot == "01 - TERRASSEMENT / GROS-OEUVRE"
+
+    def test_r5_lot_propagation_keeps_the_four_chunk_boundaries(self) -> None:
+        chunks = chunk_by_articles(_lot_propagation_pages())
+        first_lines = [c.text.split("\n")[0][:9] for c in chunks]
+        assert len(chunks) == 4
+        assert first_lines == ["1.3.4.1. ", "1.5.3. En", "2.2.1.7. ", "4.2.2.1. "]
+
+
+class TestChunkByArticlesLotLineRejectsBareNumbers:
+    def test_r6_lot_line_with_title_on_next_line_does_not_set_a_lot(self) -> None:
+        text = (
+            "LOT 03\n"
+            "MENUISERIES INTERIEURES\n\n"
+            "3.1.1. Portes de distribution\n"
+            "Les portes de distribution sont à âme alvéolaire, finition peinte, "
+            "avec huisserie bois et quincaillerie de série, posées après "
+            "achèvement des cloisons."
+        )
+        chunks = chunk_by_articles([ExtractedPage(text=text, page=1, source="test")])
+        chunk = next(c for c in chunks if c.text.startswith("3.1.1."))
+        assert chunk.chunk_lot == ""
+        assert not any(c.chunk_lot.startswith("00") for c in chunks)
+
+    def test_r7_lot_line_with_number_only_does_not_set_a_lot(self) -> None:
+        text = (
+            "1.1.1. Objet\n"
+            "Le présent lot concerne la fourniture et la pose des ouvrages "
+            "décrits ci-après, y compris toutes sujétions de mise en oeuvre.\n\n"
+            "Lot n°12\n\n"
+            "12.1.1. Généralités\n"
+            "Les ouvrages sont réalisés conformément aux documents techniques "
+            "unifiés en vigueur et aux prescriptions des fabricants retenus."
+        )
+        chunks = chunk_by_articles([ExtractedPage(text=text, page=1, source="test")])
+        chunk = next(c for c in chunks if c.text.startswith("12.1.1."))
+        assert chunk.chunk_lot == ""
+
+    def test_r8_prose_line_starting_with_lot_and_lowercase_does_not_set_a_lot(self) -> None:
+        text = (
+            "1.1.1. Objet\n"
+            "Les travaux décrits au présent document sont réalisés selon les "
+            "règles de l'art, avec les matériaux et les tolérances prévus.\n"
+            "Lot 3 à 5 compris dans le présent marché.\n\n"
+            "1.1.2. Suite\n"
+            "L'entreprise vérifie les supports avant intervention et signale "
+            "toute anomalie au maître d'oeuvre avant le début des travaux."
+        )
+        chunks = chunk_by_articles([ExtractedPage(text=text, page=1, source="test")])
+        chunk = next(c for c in chunks if c.text.startswith("1.1.2."))
+        assert chunk.chunk_lot == ""
+
+    def test_r9_lot_line_with_title_case_title_still_sets_the_lot(self) -> None:
+        text = (
+            "1.1.1. Objet\n"
+            "Le présent lot concerne la fourniture et la pose des ouvrages "
+            "décrits ci-après, y compris toutes sujétions de mise en oeuvre.\n\n"
+            "Lot n°4 Menuiserie extérieure\n\n"
+            "4.1.1. Châssis\n"
+            "Les châssis sont en aluminium thermolaqué, à rupture de pont "
+            "thermique, avec vitrage isolant et joints d'étanchéité continus."
+        )
+        chunks = chunk_by_articles([ExtractedPage(text=text, page=1, source="test")])
+        chunk = next(c for c in chunks if c.text.startswith("4.1.1."))
+        assert chunk.chunk_lot == "04 - Menuiserie extérieure"

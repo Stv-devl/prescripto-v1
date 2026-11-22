@@ -1,7 +1,9 @@
 # RAG chat: retrieval, generation, streaming
 
-`POST /projects/{project_id}/chat` streams a Mistral answer over SSE, grounded
-in the project's ingested corpus. Chat is always project-scoped: every
+`POST /projects/{project_id}/chat` streams an LLM answer over SSE, grounded
+in the project's ingested corpus. The chat's LLM provider is Mistral by
+default, or OpenAI with `CHAT_PROVIDER=openai` (see
+[LLM provider](#llm-provider-chat_provider)). Chat is always project-scoped: every
 retrieval carries both `tenant_id` and `project_id` (see
 [Scope, honestly](#scope-honestly)).
 
@@ -22,13 +24,15 @@ Modules of `backend/app/services/chat/`:
 | `chunk_enrichment.py`, `context_enrichment.py` | Heading expansion, DPGF quantities, project metadata for broad questions |
 | `sufficiency.py`, `tool_retry.py` | Broad-scope judge and the tool-using retry |
 | `table_extraction.py`, `schema_extraction.py` | Structured table and technical-schema extraction |
-| `model_routing.py` | Which model each call uses, prompt-cache keys, pricing |
+| `llm.py` | The one entry point of the seven chat LLM calls (`complete`, `open_stream`): provider, model and limiter per call |
+| `model_routing.py` | Which model each call uses, the Mistral-to-OpenAI mapping (`effective_model`), prompt-cache keys, pricing |
 | `question_log.py`, `step_timing.py` | The per-question log record and its timings |
 | `conversation.py` | Conversation CRUD (tenant checked through the project) |
 
 Search itself lives in `backend/app/services/search.py` and
 `backend/app/services/sparse.py`; the Mistral client and rate limiters in
-`backend/app/core/mistral.py`.
+`backend/app/core/mistral.py`; the OpenAI client and its limiter in
+`backend/app/core/openai.py`.
 
 ## The graph
 
@@ -66,8 +70,8 @@ run when the context is non-empty. All targets join on `join_node`.
 
 State (`ChatState`) carries the question and history, the rewrite output
 (`search_query`, `related_queries`, `scope`, flags), the per-scope limits, the
-search results, the rendered `context_block`, the `sources`, the Mistral
-messages, the usage of each call, and the retry bookkeeping (`judgment_missing`,
+search results, the rendered `context_block`, the `sources`, the chat
+messages (`mistral_messages`, sent as-is to either provider), the usage of each call, and the retry bookkeeping (`judgment_missing`,
 `needs_retry`, `retried`).
 
 ## Query rewrite
@@ -212,18 +216,40 @@ Run inside `_run_search` (narrow scope) and `enrich_node`:
    such as `1.1.3.9.`), collapsing whitespace and lowercasing; passages with the
    same key are rendered once, the highest-scored copy kept, under a header
    listing every location: `[file, p.3 ; aussi : file, p.9 ; ...]`. The lot is
-   omitted from that header since it is document-level metadata.
+   omitted from that header; when the context spans several lots the kept copy
+   sits under its own lot block, and copies merged from other lots do not show
+   theirs.
 
 Passages are rendered as `[filename, p.N]` followed by the text, grouped under
-`=== lot ===` separators when more than one lot is present, joined by `---`.
+`=== lot ===` separators when more than one lot is present, joined by `---`
+(a passage with no lot goes under `=== unknown ===`). The lot is the chunk's
+own payload value, read at chunking from the CCTP's lot lines (`NN - TITLE`,
+e.g. `=== 04 - MENUISERIE EXTERIEURE / SERRURERIE ===`), so a multi-lot CCTP
+spreads its passages over several blocks.
 
 ## Prompt construction
 
-`_build_mistral_messages` builds the message list:
+`_build_mistral_messages` builds the message list (the same list is sent to
+either provider):
 
 - **System prompt**: `system_prompt_for(mode)` (French; answer only from the
   documents, never cite sources inline, concise, full dimensions, one block per
   work item, one `Localisation` block at the end).
+- **Answer rules (v1)**: `system_prompt_for("v1")` rewrites the baseline
+  rules by string replacement (`_v1_answer_rules`); the baseline prompt is
+  unchanged. Concision cuts words, never data (every value, dimension,
+  reference, brand, model, rating, variant and norm about the work item);
+  a single-value or yes/no question gets one full sentence that restates the
+  object (`Oui, ...` / `Non, ...`, never a bare word); a passage belongs to
+  the lot of its `=== NN - TITLE ===` block, and the separators are never
+  copied into the answer; a question about how work splits between lots gets
+  one part per lot, each opened by its block's title; when "the norm" or "the
+  DTU" is asked and the context holds several, all are cited; from two
+  components or characteristics on, the bullet list is mandatory, and so is
+  the `Normes` block when a context norm relates to the work item;
+  `Localisation` is condensed to one rule (a single recap block at the very
+  end); the final validation rule (counting the `Localisation` occurrences)
+  is removed.
 - **Scope block**: broad questions get an enumeration/summary format ending in
   a fixed disclaimer sentence; narrow ones get the localisation instruction.
   A question about exterior walls adds a composition instruction.
@@ -255,23 +281,63 @@ Passages are rendered as `[filename, p.N]` followed by the text, grouped under
 | Query rewrite | `V1_REWRITE_MODEL` under v1 (default `mistral-large-latest`) |
 | Sufficiency judge, query reformulation, tool-retry turn | `V1_FAST_MODEL` under v1 (default `mistral-small-latest`) |
 
-Under baseline every call uses mistral-large. `model_routing.py` also carries
-the per-model price table used to compute the usage figures.
+Under baseline every call uses mistral-large. These are the models requested
+on the Mistral side: the client in `core/mistral.py` pins
+`mistral-large-latest` to `mistral-large-2512` before each request
+(`MODEL_PINS`). Under `CHAT_PROVIDER=openai` each requested model is mapped
+(next section). `model_routing.py` also carries the per-model price table
+(`MODEL_PRICES`, Mistral and OpenAI models) used to compute the usage figures;
+an unknown model is priced as mistral-large.
 
-**Prompt caching (v1).** Four calls pass a fixed `prompt_cache_key` to
-Mistral: `prescripto-v1-generation`, `-rewrite`, `-judge`, `-reformulate`. The
-keys are shared across tenants on purpose: the shared prefix is the system
-prompt, which holds no client data. The tool-retry turn and the two
-extractions send no key. Cached input tokens are read back from the usage
-details and priced at a reduced input rate.
+**Prompt caching (v1).** Four calls pass a fixed `prompt_cache_key`, on
+either provider: `prescripto-v1-generation`, `-rewrite`, `-judge`,
+`-reformulate`. The keys are shared across tenants on purpose: the shared
+prefix is the system prompt, which holds no client data. The tool-retry turn
+and the two extractions send no key. Cached input tokens are read back from
+the usage details and priced at the model's own `cached_input` rate when the
+price table has one, else at 10 % of the input rate.
+
+## LLM provider: CHAT_PROVIDER
+
+`CHAT_PROVIDER` (`mistral` by default, or `openai`, which requires
+`OPENAI_API_KEY`) chooses the provider of the seven chat LLM calls: query rewrite
+(`query_rewrite.py`), sufficiency judge and reformulation (`sufficiency.py`),
+tool-retry turn (`tool_retry.py`), streamed generation (`graph.py`), table and
+schema extraction (`table_extraction.py`, `schema_extraction.py`). None of
+them calls a provider SDK directly: they go through `llm.py`, `complete` for
+the non-streamed calls and `open_stream` for the generation. The setting is
+read at call time. Embeddings, ingestion and the project summary stay on
+Mistral whatever it says.
+
+- **Mistral**: the request is the one the chat sent before the switch, on the
+  pinned Mistral client, after the Mistral limiter the caller picked.
+- **OpenAI**: `effective_model` maps the requested model,
+  `OPENAI_CHAT_MODEL` in place of mistral-large and `OPENAI_FAST_MODEL` in
+  place of any other model (both default `gpt-5.4-mini`); `openai_limiter`
+  replaces the Mistral limiter; `max_tokens` is sent as
+  `max_completion_tokens`. `temperature` is sent only when
+  `OPENAI_REASONING_EFFORT` is `none` (the default), since reasoning
+  models reject it otherwise; a set effort is sent as `reasoning_effort`. The
+  OpenAI usage is converted to a Mistral `UsageInfo`, cached tokens included,
+  so cost and cache accounting are unchanged.
+- **Tool calls**: `tool_choice` is `any` on Mistral and `required` on
+  OpenAI, with parallel tool calls on both.
+
+Errors propagate unchanged on both providers: each caller keeps its own
+fallback. Rollback is setting `CHAT_PROVIDER` back to `mistral`.
 
 ## Rate limiting
 
 `core/mistral.py` defines two process-local `_RateLimiter` instances that
 serialize calls to a fixed rate: `mistral_large_limiter` (0.25 requests/s) and
-`mistral_fast_limiter` (`V1_FAST_RPS`, default 1.5). Every Mistral chat call
-awaits the limiter matching its model (`is_large(model)` selects it). The time
-a call waited is recorded as a `<step>_wait` timing. Since the limiters are
+`mistral_fast_limiter` (`V1_FAST_RPS`, default 1.5). Under Mistral every chat
+call awaits the limiter matching its model (`is_large(model)` selects it).
+Under OpenAI every chat call awaits the single `openai_limiter` of
+`core/openai.py` (`OPENAI_RPS`, default 5) instead (`llm.wait_turn`). The OpenAI
+client is built on first use with `max_retries=0`, so a 429 reaches the
+caller's fallback as on the Mistral path. The time a call waited is recorded
+as a `<step>_wait` timing; the generation waits before opening its stream, so
+the time to first token is measured from the request. Since the limiters are
 per process, several backend tasks share the provider quota and must split the
 configured value.
 
@@ -284,7 +350,8 @@ a short `manque` text. An unreadable reply or a failed call counts as
 sufficient, so the judge never blocks an answer.
 
 On an insufficient verdict, and at most once per question, `retry_search_node`
-runs `retry_with_tools`: one Mistral tool-calling turn (the fast model) over
+runs `retry_with_tools`: one tool-calling turn (the fast model, on the
+configured provider) over
 the MCP read tools `search_documents` and `read_passage`, with `project_id`
 and `tenant_id` hidden from the model and injected server-side. At most three
 tool calls run, in sequence; the first invalid call stops the rest. The tools
@@ -354,6 +421,8 @@ keys: it never contains the question, rewrite, context, answer, or the
 judge's `manque` text. Fields, at a high level:
 
 - identifiers: `tenant_id`, `conversation_id`, the retrieval `mode`;
+- `llm_provider` (`CHAT_PROVIDER`) and `llm_model` (the model name the generation
+  requested after the provider mapping, before the Mistral version pin);
 - flags: `scope`, `judged`, `retried`, `outcome` (`answered`, `no_context`,
   `search_error`, `failed`);
 - totals: `latency_ms`, `ttft_ms`, input/cached/output tokens and `cost_usd`;

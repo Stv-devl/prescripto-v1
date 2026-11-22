@@ -18,6 +18,7 @@ from mistralai.client.models import UsageInfo
 from app.core.config import settings
 from app.core.mistral import mistral_client, mistral_fast_limiter, mistral_large_limiter
 from app.schemas.search import SearchResult, ToolPassage
+from app.services.chat import llm
 from app.services.chat.model_routing import is_large, short_call_model
 from app.services.injection_guard import neutralise_tags
 from app.services.mcp_tools import FILTER_MAX_CHARS, QUERY_MAX_CHARS, READ_PASSAGE_SCORE
@@ -140,22 +141,21 @@ async def retry_with_tools(
         f"Question : {question}\n\n<manque>\n{neutralise_tags(missing, 'manque')}\n</manque>"
     )
 
-    await limiter.wait()
-    response = await mistral_client.chat.complete_async(
+    reply = await llm.complete(
+        mistral_client,
+        limiter,
         model=model,
         messages=[
             {"role": "system", "content": TOOL_RETRY_PROMPT},
             {"role": "user", "content": user_turn},
         ],
-        tools=[_mistral_tool(tool) for tool in listing.tools],
-        tool_choice="any",
-        parallel_tool_calls=True,
         temperature=0.0,
+        tools=[_mistral_tool(tool) for tool in listing.tools],
     )
-    if response.usage is not None:
-        usage_sink.append(response.usage)
+    if reply.usage is not None:
+        usage_sink.append(reply.usage)
 
-    tool_calls = response.choices[0].message.tool_calls or []  # type: ignore[union-attr]
+    tool_calls = reply.tool_calls
     results: list[SearchResult] = []
     seen: set[str] = set()
     queries: list[str] = []

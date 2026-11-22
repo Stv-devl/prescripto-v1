@@ -75,9 +75,9 @@ def _format_location(location: tuple[str, int]) -> str:
 def passage_header(passage: MergedPassage) -> str:
     """One-line header of a context passage, naming file and page of every copy.
 
-    The lot is left out on purpose: it is document-level metadata, so a multi-lot CCTP carries a
-    single lot for all its pages and would mislabel most copies. A single distinct location keeps
-    the builder's historical `[filename, p.N]` form. Several are listed kept copy first, then the
+    The lot is left out on purpose: when the context spans several lots, the builders already
+    group passages under `=== <lot> ===` blocks (the kept copy's lot; merged copies from other
+    lots do not show theirs). A single distinct location keeps the builder's historical `[filename, p.N]` form. Several are listed kept copy first, then the
     others in input order, each location once.
     """
     locations = [_location(passage.kept)]

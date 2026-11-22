@@ -8,7 +8,7 @@ imports the same constant instead of a second spelling.
 import ipaddress
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 DEV_SEED_EMAIL = "dev@prescripto.fr"
@@ -93,6 +93,31 @@ class Settings(BaseSettings):
 
     mistral_api_key: str
     openai_api_key: str | None = None
+    chat_provider: Literal["mistral", "openai"] = Field(
+        default="mistral",
+        description=(
+            "LLM provider of the chat calls (rewrite, judge, reformulation, tool retry, "
+            "generation, table/schema extraction). Embeddings, ingestion and the project "
+            "summary stay on Mistral whatever this says. Rollback = set it back to mistral."
+        ),
+    )
+    openai_chat_model: str = Field(
+        default="gpt-5.4-mini",
+        description="OpenAI model standing in for mistral-large on the openai provider.",
+    )
+    openai_fast_model: str = Field(
+        default="gpt-5.4-mini",
+        description="OpenAI model standing in for every non-large Mistral model.",
+    )
+    openai_reasoning_effort: Literal["none", "minimal", "low", "medium"] | None = Field(
+        default="none",
+        description="reasoning_effort sent to OpenAI; None sends nothing (model default).",
+    )
+    openai_rps: float = Field(
+        default=5.0,
+        gt=0,
+        description="Requests per second of the one OpenAI rate limiter, per process.",
+    )
     pixtral_large_model: str = "pixtral-large-latest"
     pixtral_small_model: str = "pixtral-12b-2409"
     vision_dpi: int = 200
@@ -188,6 +213,15 @@ class Settings(BaseSettings):
     def dev_mode(self) -> bool:
         """Developer shortcuts (auth bypass, dev seeding) — local environment only."""
         return self.environment == "local"
+
+    @field_validator("chat_provider")
+    @classmethod
+    def _openai_needs_its_key(cls, value: str, info: ValidationInfo) -> str:
+        """Refuse to boot on the openai provider without a key, rather than fail the first
+        question. The message names the variable only, never a value."""
+        if value == "openai" and not info.data.get("openai_api_key"):
+            raise ValueError("OPENAI_API_KEY is required when CHAT_PROVIDER=openai")
+        return value
 
     @field_validator("jwt_secret_key")
     @classmethod

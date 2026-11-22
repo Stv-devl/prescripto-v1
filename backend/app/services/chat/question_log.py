@@ -33,13 +33,15 @@ def build_question_record(
     ttft_ms: int | None,
     failed: bool,
     timings: Mapping[str, int] | None = None,
+    llm: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Build the JSON-serialisable `chat_question` record for one question.
 
     Top-level tokens and cost are `usage["total"]`; `legs` holds every other usage key
     as-is. `judged` is true as soon as the judge node wrote `judgment_missing`, even as
     None (sufficient). `timings`, when given, adds one integer `<step>_ms` key per step
-    and may not shadow a contract key."""
+    and may not shadow a contract key. `llm`, when given, adds `llm_provider` and
+    `llm_model` (the generation's provider and the model it actually reached)."""
     total = usage["total"]
     scope = state.get("scope")
     record: dict[str, object] = {
@@ -63,4 +65,7 @@ def build_question_record(
         if not key.endswith("_ms") or key in record or type(value) is not int:
             raise ValueError(f"invalid step timing field: {key!r}")
         record[key] = value
+    if llm is not None:
+        record["llm_provider"] = llm["llm_provider"]
+        record["llm_model"] = llm["llm_model"]
     return record

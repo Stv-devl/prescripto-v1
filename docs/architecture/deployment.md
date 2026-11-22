@@ -6,6 +6,15 @@ guards in the code that make a deployed instance refuse to start misconfigured.
 It describes shape, not identifiers: nothing here names an account, a resource
 or a secret.
 
+> **Historical topology.** Since 2026-10-28 production runs on a single AWS
+> Lightsail instance in `eu-west-3`: the API and PostgreSQL in containers behind
+> Caddy, Qdrant Cloud for vectors, the client on Vercel. ECS Fargate, the ALB/WAF
+> and RDS described below were removed, and secrets now live in the instance's
+> environment file rather than a secrets store. The application-level content
+> (startup guards, configuration variables, the chat LLM provider, migrations
+> being additive) still applies; the infrastructure sections are kept for the
+> record until this document is rewritten.
+
 ## Topology
 
 ```mermaid
@@ -17,6 +26,7 @@ flowchart LR
     ECS --> RDS[("RDS PostgreSQL 16")]
     ECS --> QC[("Qdrant Cloud\napi-key auth")]
     ECS --> MI["Mistral API"]
+    ECS -.->|"chat only, CHAT_PROVIDER=openai"| OA["OpenAI API"]
     ECS --> LS["LangSmith\ntracing"]
     ECS -->|"stdout JSON lines"| CW["CloudWatch Logs\nmetric filters + alarms"]
     SM["Secrets store"] -.->|"injected into the task definition"| ECS
@@ -67,9 +77,28 @@ no server-side error.
 Settings are plain environment variables read by `Settings` in
 `backend/app/core/config.py`. In AWS they are injected into the ECS task
 definition from a managed secrets store (database URL, JWT signing key, Qdrant
-and Mistral keys, LangSmith key, and so on), so no secret is baked into the
+and Mistral keys, OpenAI key, LangSmith key, and so on), so no secret is baked into the
 image or committed. Non-secret flags (`ENVIRONMENT`, `CORS_ORIGINS`,
-`FORWARDED_ALLOW_IPS`, `MCP_ALLOWED_HOSTS`) are set the same way.
+`FORWARDED_ALLOW_IPS`, `MCP_ALLOWED_HOSTS`, `CHAT_PROVIDER`) are set the same way.
+
+### The chat LLM provider
+
+`CHAT_PROVIDER` selects the provider of the chat calls (query rewrite, judge,
+reformulation, tool retry, generation, table and schema extraction): `mistral`,
+the default, or `openai`. Embeddings, ingestion and the project summary stay on
+Mistral whatever it says, so `MISTRAL_API_KEY` is always required. The
+`openai` mode reads:
+
+| Variable | Default | Role |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | none | required only when `CHAT_PROVIDER=openai`; without it `Settings()` refuses to be built, in every environment |
+| `OPENAI_CHAT_MODEL` | `gpt-5.4-mini` | stands in for `mistral-large` |
+| `OPENAI_FAST_MODEL` | `gpt-5.4-mini` | stands in for every other Mistral model |
+| `OPENAI_REASONING_EFFORT` | `none` | `reasoning_effort` sent to OpenAI |
+| `OPENAI_RPS` | `5` | requests per second of the one OpenAI rate limiter, per process |
+
+Switching back is configuration only: set `CHAT_PROVIDER=mistral` and recreate
+the API container; no code is redeployed.
 
 ### The production lock-down
 

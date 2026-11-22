@@ -1,6 +1,7 @@
 """Model routing of the short chat calls (query rewrite, sufficiency judge, retry
 reformulation): which model each one calls, and at what price its usage is counted
-(j3-routage-mistral-small). Generation always stays on mistral-large.
+(j3-routage-mistral-small). Generation always requests mistral-large; with
+CHAT_PROVIDER=openai, `effective_model` maps it to the configured OpenAI model.
 
 Also the v1 prompt-cache keys of the four chat calls and the pricing of cached input
 tokens (j3-prompt-caching)."""
@@ -33,7 +34,20 @@ MODEL_PRICES: dict[str, Price] = {
     LARGE_MODEL: LARGE_PRICE,
     "mistral-small-latest": _SMALL_PRICE,
     "mistral-small-2603": _SMALL_PRICE,
+    "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "output": 1.20},
+    "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
+    "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
 }
+
+ChatProvider = Literal["mistral", "openai"]
+
+
+def effective_model(provider: ChatProvider, model: str, *, chat_model: str, fast_model: str) -> str:
+    """The model a chat call actually reaches: `model` itself on Mistral; on OpenAI,
+    `chat_model` in place of mistral-large and `fast_model` in place of any other model."""
+    if provider == "mistral":
+        return model
+    return chat_model if is_large(model) else fast_model
 
 
 def short_call_model(mode: str, fast_model: str) -> str:
@@ -76,8 +90,9 @@ def cached_tokens_of(usage: UsageInfo | None) -> int:
 
 
 def input_cost_usd(prompt_tokens: int, cached_tokens: int, price: Price) -> float:
-    """USD input cost: uncached tokens at the full input price, cached ones at
-    CACHED_INPUT_PRICE_RATIO of it. `prompt_tokens` includes the cached ones."""
+    """USD input cost: uncached tokens at the full input price, cached ones at the price's own
+    `cached_input` when it has one, else at CACHED_INPUT_PRICE_RATIO of the input price.
+    `prompt_tokens` includes the cached ones."""
     uncached = prompt_tokens - cached_tokens
-    cached_price = price["input"] * CACHED_INPUT_PRICE_RATIO
+    cached_price = price.get("cached_input", price["input"] * CACHED_INPUT_PRICE_RATIO)
     return (uncached * price["input"] + cached_tokens * cached_price) / 1_000_000

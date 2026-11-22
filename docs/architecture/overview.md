@@ -9,8 +9,9 @@ actual code (file paths, real snippets), not the intended design.
   cleaning → classification → chunking → dense + sparse vectors → Qdrant,
   and the prompt-injection flag set at ingestion.
 - [`rag-chat.md`](./rag-chat.md) — the LangGraph chat graph: query rewrite,
-  hybrid retrieval, context assembly, model routing, the broad-scope judge
-  and tool retry, streamed generation, source traceability.
+  hybrid retrieval, context assembly, model routing and the chat's LLM
+  provider switch (`CHAT_PROVIDER`), the broad-scope judge and tool retry,
+  streamed generation, source traceability.
 - [`mcp.md`](./mcp.md) — the MCP server on `/mcp`: two read-only tools shared
   by external MCP clients and the agent's own retry, its security model and
   prompt-injection defences.
@@ -18,8 +19,9 @@ actual code (file paths, real snippets), not the intended design.
   the project-summary feature.
 - [`frontend.md`](./frontend.md) — feature-slice layout, the service/hook
   boundary, SSE consumption on the client side.
-- [`deployment.md`](./deployment.md) — the AWS production topology, the
-  container, the production lock-down, logs and alarms.
+- [`deployment.md`](./deployment.md) — the production lock-down, configuration
+  and chat LLM provider; its infrastructure sections describe the former ECS/RDS
+  topology, replaced by one Lightsail instance on 2026-10-28.
 - [`ci.md`](./ci.md) — the four required checks on `main`, including the
   retrieval-recall eval gate on a self-hosted runner.
 
@@ -33,7 +35,7 @@ flowchart LR
 
     EXT["External MCP client\nClaude Code · Claude Desktop · Cursor"]
 
-    subgraph API["backend/app/ — FastAPI (ECS Fargate)"]
+    subgraph API["backend/app/ — FastAPI (container, AWS Lightsail)"]
         AUTH["auth: JWT + tenant_id\nDepends(get_current_user)"]
         ING["ingestion:\nextract → clean → classify → chunk → embed"]
         CHAT["chat (LangGraph):\nrewrite → hybrid search → enrich\n→ judge / tool retry → generate"]
@@ -41,9 +43,10 @@ flowchart LR
         SUM["summary:\n16-section extraction"]
     end
 
-    PG[("PostgreSQL (RDS)\nprojects, documents, chunks,\nconversations, messages")]
+    PG[("PostgreSQL 16 (container)\nprojects, documents, chunks,\nconversations, messages")]
     QD[("Qdrant Cloud\ndense + sparse vectors\ntenant_id + project_id filtered")]
     MISTRAL["Mistral\nmistral-embed · mistral-large · mistral-small"]
+    OPENAI["OpenAI\nchat calls only, CHAT_PROVIDER=openai"]
     LS["LangSmith\ntracing"]
 
     UI -->|JWT bearer| AUTH
@@ -55,6 +58,7 @@ flowchart LR
     ING --> QD
     CHAT --> QD
     CHAT --> MISTRAL
+    CHAT -.-> OPENAI
     CHAT --> PG
     CHAT -.-> LS
     MCP --> QD
@@ -74,6 +78,7 @@ ideas were never built — worth knowing before reading it as current truth:
 | Cross-encoder re-ranking of retrieved chunks | Not in the code — ordering is the dense + BM25 fusion plus a couple of hand-written score penalties (see [`rag-chat.md`](./rag-chat.md#retrieval)) |
 | A tenant-wide "global search" mode across projects | Not implemented — every search is project-scoped (see [`rag-chat.md`](./rag-chat.md#scope-honestly)) |
 | Per-chunk `date` metadata | Not extracted — only an `ingested_at` timestamp exists |
+| Mistral Large as the only LLM | Ingestion, embeddings and the summary stay on Mistral; the chat's LLM calls go to Mistral by default, or to OpenAI with `CHAT_PROVIDER=openai` (see [`rag-chat.md`](./rag-chat.md#llm-provider-chat_provider)) |
 
 Two smaller, structural gaps worth knowing if you're extending this system:
 

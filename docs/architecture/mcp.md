@@ -71,8 +71,9 @@ retrieval insufficient and the retry has not run yet. It does not go over HTTP:
 `create_connected_server_and_client_session` links an MCP client session to a
 second, internal `FastMCP` server inside the process. The internal server
 reuses the chat request's database session, and is built on first use rather
-than at import. `retry_with_tools` (`tool_retry.py`) then runs one Mistral
-tool-calling turn:
+than at import. `retry_with_tools` (`tool_retry.py`) then runs one
+tool-calling turn on the chat provider (`CHAT_PROVIDER`: Mistral by default,
+or OpenAI):
 
 - The model receives the question and the judge's description of what was
   missing, framed as data, and the tool definitions listed by the session.
