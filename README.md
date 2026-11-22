@@ -86,11 +86,12 @@ flowchart LR
   attempts are flagged at this stage.
 - **Chat.** The question runs through a LangGraph graph: a rewrite into a
   search query, hybrid retrieval (dense + BM25, fused) filtered by tenant and
-  project, context assembly, then a streamed Mistral answer over SSE. A
+  project, context assembly, then a streamed answer over SSE. A
   requested table or technical schema is extracted in parallel with the
   answer. For broad questions, a judge checks whether the retrieved context
   is sufficient and, if not, the agent searches again with tools before
-  answering.
+  answering. The chat's LLM calls run on Mistral by default, or on OpenAI
+  with `CHAT_PROVIDER=openai`; embeddings stay on Mistral either way.
 - **Summary.** Each project can produce a structured technical summary
   extracted from its ingested corpus.
 
@@ -107,6 +108,10 @@ flowchart LR
   filters by `tenant_id`.
 - **Model routing** — `mistral-large` for the rewrite and the answer,
   `mistral-small` for the lighter judging steps, with per-prompt cache keys.
+  `CHAT_PROVIDER=openai` moves the chat calls (rewrite, judge, reformulation,
+  tool retry, generation, table and schema extraction) to OpenAI (`gpt-5.4-mini`
+  by default, `OPENAI_CHAT_MODEL` / `OPENAI_FAST_MODEL`);
+  embeddings, ingestion and the project summary stay on Mistral.
 - **MCP server** — the corpus is exposed as read-only tools to any MCP client.
 - **Prompt-injection defences** — retrieved text is framed as data, never as
   instructions, and suspicious passages are flagged and surfaced as warnings.
@@ -147,9 +152,9 @@ Security model, tool signatures and injection defences:
 | Backend tests | pytest + pytest-asyncio, Ruff |
 | Relational store | PostgreSQL 16 — every table isolated by `tenant_id` |
 | Vector store | Qdrant — dense + BM25 sparse vectors, tenant filter on every query |
-| LLM | Mistral — `mistral-large-latest` (rewrite, generation), `mistral-small` (judge, reformulation), `mistral-embed` (1024 dim) |
+| LLM | Mistral — `mistral-large-latest` (rewrite, generation), `mistral-small` (judge, reformulation), `mistral-embed` (1024 dim); optional OpenAI (default `gpt-5.4-mini`) for the chat calls (`CHAT_PROVIDER=openai`) |
 | Tool protocol | MCP (FastMCP, streamable HTTP) |
-| Hosting | AWS `eu-west-3` — ECS Fargate behind an ALB + WAF, RDS, Qdrant Cloud; client on Vercel |
+| Hosting | AWS Lightsail `eu-west-3` — one instance running the API and PostgreSQL in containers behind Caddy, Qdrant Cloud; client on Vercel |
 | CI | GitHub Actions — hosted runners, plus a self-hosted runner for the eval gate |
 
 ## Quality gates
@@ -196,7 +201,7 @@ backend/app/
 │   └── auth · project · folder · document · summary · email · admin
 ├── models/           # SQLAlchemy ORM — tenant, user, project, folder, document, chunk, conversation, message, summary
 ├── schemas/          # Pydantic request/response models
-└── core/             # config, auth, DB session, external clients (Qdrant, Mistral), rate limits, tracing
+└── core/             # config, auth, DB session, external clients (Qdrant, Mistral, OpenAI), rate limits, tracing
 
 shared/schemas/       # Zod schemas shared between client and backend contracts
 .github/workflows/    # ci.yml (deterministic gates) · eval.yml (retrieval-recall gate)
@@ -204,7 +209,7 @@ shared/schemas/       # Zod schemas shared between client and backend contracts
 
 Architectural rules: `api/` never queries the database or calls an external
 client directly — that belongs to `services/`, the only layer allowed to touch
-Qdrant or Mistral. Every SQL query and every vector search filters by
+Qdrant, Mistral or OpenAI. Every SQL query and every vector search filters by
 `tenant_id`; there is no database-level isolation (no RLS), so this filter is
 the entire multi-tenancy boundary.
 

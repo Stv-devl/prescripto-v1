@@ -56,7 +56,10 @@ Python 3.12 through `uv` (`uv sync --extra dev --frozen`), working directory
    `backend/pyproject.toml`: `--cov=app --cov-fail-under=78`. The enforced floor
    is **78 percent** overall, the measured coverage rounded down; the 85 percent
    figure in the backend rules is the target, not what the gate checks today. `tests/conftest.py` provides
-   placeholder settings, so nothing reaches Postgres, Qdrant or Mistral.
+   placeholder settings, so nothing reaches Postgres, Qdrant or Mistral. It
+   also forces `CHAT_PROVIDER=mistral`, so an exported `openai` value never
+   sends test prompts to OpenAI; the OpenAI cases set the provider themselves
+   against mocks.
 2. **Lint** - `ruff check .`
 3. **Format** - `ruff format --check app/` (scoped to `app/` on purpose: the
    frozen test tree is never reformatted).

@@ -16,6 +16,11 @@ uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
 ```
 
+`MISTRAL_API_KEY` reste obligatoire quel que soit le fournisseur du chat
+(embeddings, ingestion et synthèse restent sur Mistral). `CHAT_PROVIDER=mistral`
+est le défaut ; avec `CHAT_PROVIDER=openai`, les appels LLM du chat passent sur
+OpenAI et `OPENAI_API_KEY` devient obligatoire — l'API refuse de démarrer sans.
+
 `ENVIRONMENT=local` dans `backend/.env` est ce qui active le bypass d'auth — le
 défaut sans variable est `production` (aucun bypass). `.env.example` le
 positionne déjà à `local`.
