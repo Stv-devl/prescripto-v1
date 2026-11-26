@@ -3,9 +3,10 @@
 `get_document` is the low-level accessor every document operation goes through.
 Today it takes no tenant key: the barrier lives in its callers, and nothing
 stops a future caller from reading another customer's row. These tests state
-the contract it must satisfy on its own — the same one `get_project` already
-has: `NotFoundError` when the row does not exist, `ForbiddenError` when it
-belongs to someone else.
+the contract it must satisfy on its own — the same one `get_project` has:
+`NotFoundError` when the tenant owns no such document, whether the row does
+not exist or belongs to someone else. The two answer alike, so a caller cannot
+learn that an id is live in another tenant.
 
 `TestDocumentOperationsStayIsolated` holds guardrails: `delete_document` and
 `move_document` already refuse cross-tenant access through the parent project,
@@ -80,11 +81,11 @@ class TestGetDocumentTenantScope:
     async def test_get_document_of_another_tenant_is_refused(
         self, db: AsyncSession, tenant_a: Tenant, tenant_b: Tenant
     ) -> None:
-        """Tenant A asking for a document of tenant B is denied, not served the row."""
+        """Tenant A asking for a document of tenant B is told it does not exist."""
         project = await _project_of(db, tenant_b, "Secret de B")
         document = await _document_of(db, project, "secret.pdf")
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await document_service.get_document(db, tenant_a.id, document.id)
 
     async def test_get_document_with_its_own_tenant_returns_the_row(
@@ -100,22 +101,22 @@ class TestGetDocumentTenantScope:
         assert fetched.filename == "cctp.pdf"
         assert fetched.project_id == project.id
 
-    async def test_get_document_unknown_id_is_not_found_and_differs_from_refusal(
+    async def test_get_document_unknown_id_is_not_found_like_a_foreign_one(
         self, db: AsyncSession, tenant_a: Tenant, tenant_b: Tenant
     ) -> None:
-        """An absent row and a foreign row do not answer with the same exception."""
+        """An absent row and a foreign row answer with the same exception and status."""
         project = await _project_of(db, tenant_b, "Secret de B")
         document = await _document_of(db, project, "secret.pdf")
 
         with pytest.raises(NotFoundError) as absent:
             await document_service.get_document(db, tenant_a.id, uuid.uuid4())
 
-        with pytest.raises(ForbiddenError) as refused:
+        with pytest.raises(NotFoundError) as refused:
             await document_service.get_document(db, tenant_a.id, document.id)
 
-        assert type(absent.value) is not type(refused.value)
+        assert type(absent.value) is type(refused.value)
         assert absent.value.status_code == 404
-        assert refused.value.status_code == 403
+        assert refused.value.status_code == 404
 
 
 class TestDocumentOperationsStayIsolated:
@@ -126,7 +127,7 @@ class TestDocumentOperationsStayIsolated:
         project = await _project_of(db, tenant_b, "Secret de B")
         document = await _document_of(db, project, "secret.pdf")
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await document_service.delete_document(
                 db, tenant_id=tenant_a.id, document_id=document.id
             )
@@ -146,7 +147,7 @@ class TestDocumentOperationsStayIsolated:
         await db.refresh(folder)
         document = await _document_of(db, project, "secret.pdf")
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await document_service.move_document(
                 db, tenant_id=tenant_a.id, document_id=document.id, folder_id=folder.id
             )
@@ -234,7 +235,7 @@ class TestUploadIsolation:
     ) -> None:
         project = await _project_of(db, tenant_b)
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await document_service.upload_document(
                 db, tenant_a.id, project.id, _upload("plan.pdf", PDF_HEADER + b"0" * 16)
             )
@@ -417,14 +418,15 @@ class TestFolderOwnershipOracle:
         matches, same tenant on both sides. Calling the oracle directly, on a
         folder genuinely owned by `tenant_b`, is the only way to exercise its
         own `Project.tenant_id == tenant_id` predicate rather than the
-        caller's redundant project-id equality check."""
+        caller's redundant project-id equality check. A foreign folder answers
+        `NotFoundError`, like an absent one."""
         other_tenant_project = await _project_of(db, tenant_b, "Chantier de B")
         folder = Folder(project_id=other_tenant_project.id, name="Lot 01")
         db.add(folder)
         await db.commit()
         await db.refresh(folder)
 
-        with pytest.raises(ForbiddenError) as exc_info:
+        with pytest.raises(NotFoundError) as exc_info:
             await document_service._get_folder_for_tenant(db, tenant_a.id, folder.id)
 
-        assert exc_info.value.status_code == 403
+        assert exc_info.value.status_code == 404

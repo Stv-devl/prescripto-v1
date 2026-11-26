@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.exceptions import ForbiddenError, NotFoundError
+from app.core.exceptions import NotFoundError
 from app.models.project import Project
 from app.schemas.project import ProjectUpdate
 
@@ -38,16 +38,20 @@ async def list_projects(db: AsyncSession, tenant_id: uuid.UUID) -> tuple[list[Pr
 
 
 async def get_project(db: AsyncSession, tenant_id: uuid.UUID, project_id: uuid.UUID) -> Project:
-    """Get a single project by ID, scoped to the tenant."""
-    query = select(Project).where(Project.id == project_id).options(selectinload(Project.documents))
-    result = await db.execute(query)
-    project = result.scalar_one_or_none()
+    """Get a single project by ID, scoped to the tenant.
 
+    Raises NotFoundError when the tenant owns no such project — whether the id
+    exists nowhere or under another tenant. Both answer the same, so a caller
+    cannot learn that an id is live elsewhere.
+    """
+    query = (
+        select(Project)
+        .where(Project.id == project_id, Project.tenant_id == tenant_id)
+        .options(selectinload(Project.documents))
+    )
+    project = (await db.execute(query)).scalar_one_or_none()
     if project is None:
         raise NotFoundError(f"Project {project_id} not found")
-    if project.tenant_id != tenant_id:
-        raise ForbiddenError("Access denied to this project")
-
     return project
 
 
