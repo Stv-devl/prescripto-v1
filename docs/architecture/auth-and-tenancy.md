@@ -57,9 +57,10 @@ All under `/auth`, in `backend/app/api/auth.py`:
 
 ## Tenant isolation, enforced by hand
 
-Every list/count query filters by `tenant_id`; every single-row fetch
-distinguishes "doesn't exist" (404) from "exists but belongs to another
-tenant" (403) instead of leaking the distinction:
+Every list/count query filters by `tenant_id`, and so does every single-row
+fetch. A resource of another tenant answers 404, exactly like one that does not
+exist — same status, same message — so the API never reveals that an id is
+live elsewhere:
 
 ```python
 # backend/app/services/project.py

@@ -2,7 +2,8 @@
 
 Every one of its functions delegates its tenant check to `project_service.get_project`,
 directly or through `get_conversation`. That indirection is what these cases pin:
-a conversation is reachable only through a project the caller owns.
+a conversation is reachable only through a project the caller owns. One of
+another tenant answers `NotFoundError`, like one that does not exist.
 
 `_message_to_read` degrades instead of raising when a stored JSON column cannot
 be parsed — a message written by an older version must not take the whole thread
@@ -17,7 +18,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ForbiddenError, NotFoundError
+from app.core.exceptions import NotFoundError
 from app.models.conversation import Conversation
 from app.models.message import Message
 from app.models.project import Project
@@ -189,7 +190,7 @@ class TestConversationIsolation:
             db, tenant_b.id, project.id, user.id, "Secret"
         )
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await conversation_service.get_conversation(db, tenant_a.id, foreign.id)
 
     async def test_get_conversation_unknown_id_is_not_found(
@@ -204,7 +205,7 @@ class TestConversationIsolation:
         project = await _project_of(db, tenant_b, "Secret de B")
         user = await _user_of(db, tenant_a)
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await conversation_service.create_conversation(
                 db, tenant_a.id, project.id, user.id, "Intrusion"
             )
@@ -220,7 +221,7 @@ class TestConversationIsolation:
             db, tenant_b.id, project.id, user.id, "Secret"
         )
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await conversation_service.delete_conversation(db, tenant_a.id, foreign.id)
 
         assert await _conversation_count(db) == 1
@@ -241,7 +242,7 @@ class TestConversationIsolation:
             db, tenant_b.id, project.id, user.id, "Secret"
         )
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await conversation_service.list_conversations(db, tenant_a.id, project.id)
 
     async def test_get_messages_of_another_tenants_conversation_is_refused(
@@ -256,7 +257,7 @@ class TestConversationIsolation:
         )
         await _message_in(db, foreign, "contenu confidentiel")
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await conversation_service.get_messages(db, tenant_a.id, foreign.id)
 
     async def test_get_messages_never_returns_a_message_of_another_conversation(

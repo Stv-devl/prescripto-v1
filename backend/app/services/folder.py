@@ -5,7 +5,7 @@ import uuid
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ForbiddenError, NotFoundError
+from app.core.exceptions import NotFoundError
 from app.models.document import Document
 from app.models.folder import Folder
 from app.models.project import Project
@@ -72,9 +72,9 @@ async def list_folders(
 async def get_folder(db: AsyncSession, tenant_id: uuid.UUID, folder_id: uuid.UUID) -> Folder:
     """Get a single folder by ID, scoped to the tenant.
 
-    Raises NotFoundError when no such row exists, ForbiddenError when it
-    belongs to another tenant. Folder carries no tenant_id of its own, so the
-    scope travels through the parent project — same split as get_project.
+    Raises NotFoundError when the tenant owns no such folder — absent or under
+    another tenant answer the same, like get_project. Folder carries no
+    tenant_id of its own, so the scope travels through the parent project.
     """
     scoped = (
         select(Folder)
@@ -82,13 +82,9 @@ async def get_folder(db: AsyncSession, tenant_id: uuid.UUID, folder_id: uuid.UUI
         .where(Folder.id == folder_id, Project.tenant_id == tenant_id)
     )
     folder = (await db.execute(scoped)).scalar_one_or_none()
-    if folder is not None:
-        return folder
-
-    exists = await db.execute(select(Folder.id).where(Folder.id == folder_id))
-    if exists.scalar_one_or_none() is None:
+    if folder is None:
         raise NotFoundError(f"Folder {folder_id} not found")
-    raise ForbiddenError("Access denied to this folder")
+    return folder
 
 
 async def update_folder(

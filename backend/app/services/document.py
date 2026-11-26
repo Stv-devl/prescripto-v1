@@ -57,8 +57,8 @@ async def _get_folder_for_tenant(
 
     Duplicated rather than imported: `app.services.folder` imports this module
     (for `delete_folder`'s cascade), so importing it back would be a cycle.
-    Same split as `get_document` — `NotFoundError` when the row is absent,
-    `ForbiddenError` when it exists under another tenant.
+    Same contract as `get_document`: `NotFoundError` when the tenant owns no
+    such folder, whether it is absent or under another tenant.
     """
     scoped = (
         select(Folder)
@@ -66,13 +66,9 @@ async def _get_folder_for_tenant(
         .where(Folder.id == folder_id, Project.tenant_id == tenant_id)
     )
     folder = (await db.execute(scoped)).scalar_one_or_none()
-    if folder is not None:
-        return folder
-
-    exists = await db.execute(select(Folder.id).where(Folder.id == folder_id))
-    if exists.scalar_one_or_none() is None:
+    if folder is None:
         raise NotFoundError(f"Folder {folder_id} not found")
-    raise ForbiddenError("Access denied to this folder")
+    return folder
 
 
 def _sanitize_filename(filename: str) -> str:
@@ -171,9 +167,9 @@ async def list_documents(
 async def get_document(db: AsyncSession, tenant_id: uuid.UUID, document_id: uuid.UUID) -> Document:
     """Get a single document by ID, scoped to the tenant.
 
-    Raises NotFoundError when no such row exists, ForbiddenError when it
-    belongs to another tenant — the same split as project_service.get_project,
-    which is the only precedent in this repo.
+    Raises NotFoundError when the tenant owns no such document — absent or
+    under another tenant answer the same, like project_service.get_project, so
+    a caller cannot learn that an id is live elsewhere.
     """
     scoped = (
         select(Document)
@@ -181,13 +177,9 @@ async def get_document(db: AsyncSession, tenant_id: uuid.UUID, document_id: uuid
         .where(Document.id == document_id, Project.tenant_id == tenant_id)
     )
     doc = (await db.execute(scoped)).scalar_one_or_none()
-    if doc is not None:
-        return doc
-
-    exists = await db.execute(select(Document.id).where(Document.id == document_id))
-    if exists.scalar_one_or_none() is None:
+    if doc is None:
         raise NotFoundError(f"Document {document_id} not found")
-    raise ForbiddenError("Access denied to this document")
+    return doc
 
 
 async def delete_document(

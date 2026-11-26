@@ -4,9 +4,10 @@
 `get_project`. Nothing else enforces isolation: there is no RLS and no Postgres
 policy, so a dropped `WHERE tenant_id` here opens every service above it at once.
 
-Two exceptions carry different meanings and must keep doing so: `NotFoundError`
-when the row exists for nobody, `ForbiddenError` when it belongs to someone else.
-Collapsing them into one would hide a missing check behind a plausible 404.
+A project of another tenant answers `NotFoundError`, exactly like one that
+exists for nobody: a distinct 403 would confirm that the id is live elsewhere.
+The foreign row does exist, so a dropped `WHERE tenant_id` would return it and
+fail these cases just as surely as a 403 assertion would.
 """
 
 import uuid
@@ -16,7 +17,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ForbiddenError, NotFoundError
+from app.core.exceptions import NotFoundError
 from app.models.project import Project
 from app.models.tenant import Tenant
 from app.schemas.project import ProjectUpdate
@@ -117,18 +118,18 @@ class TestProjectCrud:
 
 
 class TestProjectIsolation:
-    async def test_get_project_of_another_tenant_is_forbidden_not_not_found(
+    async def test_get_project_of_another_tenant_is_not_found(
         self, db: AsyncSession, tenant_a: Tenant, tenant_b: Tenant
     ) -> None:
-        """The two answers must stay distinguishable — a 404 here would hide the check."""
+        """A foreign project answers like an absent one — nothing says it exists."""
         foreign = await project_service.create_project(
             db, tenant_b.id, name="Secret de B", phase="PRO"
         )
 
-        with pytest.raises(ForbiddenError) as refused:
+        with pytest.raises(NotFoundError) as refused:
             await project_service.get_project(db, tenant_a.id, foreign.id)
 
-        assert refused.value.status_code == 403
+        assert refused.value.status_code == 404
 
     async def test_get_project_unknown_id_is_not_found(
         self, db: AsyncSession, tenant_a: Tenant
@@ -145,7 +146,7 @@ class TestProjectIsolation:
             db, tenant_b.id, name="Secret de B", phase="PRO"
         )
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await project_service.update_project(
                 db, tenant_a.id, foreign.id, ProjectUpdate(name="Détourné")
             )
@@ -161,7 +162,7 @@ class TestProjectIsolation:
             db, tenant_b.id, name="Secret de B", phase="PRO"
         )
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await project_service.delete_project(db, tenant_a.id, foreign.id)
 
         survivor = await _reload(db, foreign.id)

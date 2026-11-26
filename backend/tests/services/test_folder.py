@@ -3,9 +3,10 @@
 `get_folder` is the low-level accessor every folder operation goes through.
 Today it takes no tenant key: the barrier lives in its callers, and nothing
 stops a future caller from reading another customer's row. These tests state
-the contract it must satisfy on its own — the same one `get_project` already
-has: `NotFoundError` when the row does not exist, `ForbiddenError` when it
-belongs to someone else.
+the contract it must satisfy on its own — the same one `get_project` has:
+`NotFoundError` when the tenant owns no such folder, whether the row does not
+exist or belongs to someone else. The two answer alike, so a caller cannot
+learn that an id is live in another tenant.
 
 The cross-tenant guardrails for `update_folder` and `delete_folder` are not
 repeated here: `test_tenant_isolation.py` already carries them, and a twin
@@ -19,7 +20,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ForbiddenError, NotFoundError
+from app.core.exceptions import NotFoundError
 from app.models.document import Document
 from app.models.folder import Folder
 from app.models.project import Project
@@ -50,7 +51,7 @@ class TestGetFolderTenantScope:
         project = await _project_of(db, tenant_b, "Secret de B")
         folder = await _folder_of(db, project, "Lot 07 - Carrelage")
 
-        with pytest.raises(ForbiddenError):
+        with pytest.raises(NotFoundError):
             await folder_service.get_folder(db, tenant_a.id, folder.id)
 
     async def test_get_folder_with_its_own_tenant_returns_the_row(
@@ -66,28 +67,28 @@ class TestGetFolderTenantScope:
         assert fetched.name == "Lot 01"
         assert fetched.project_id == project.id
 
-    async def test_get_folder_unknown_id_is_not_found_and_differs_from_refusal(
+    async def test_get_folder_unknown_id_is_not_found_like_a_foreign_one(
         self, db: AsyncSession, tenant_a: Tenant, tenant_b: Tenant
     ) -> None:
-        """An absent row and a foreign row do not answer with the same exception."""
+        """An absent row and a foreign row answer with the same exception and status."""
         project = await _project_of(db, tenant_b, "Secret de B")
         folder = await _folder_of(db, project, "Lot 07 - Carrelage")
 
         with pytest.raises(NotFoundError) as absent:
             await folder_service.get_folder(db, tenant_a.id, uuid.uuid4())
 
-        with pytest.raises(ForbiddenError) as refused:
+        with pytest.raises(NotFoundError) as refused:
             await folder_service.get_folder(db, tenant_a.id, folder.id)
 
-        assert type(absent.value) is not type(refused.value)
+        assert type(absent.value) is type(refused.value)
         assert absent.value.status_code == 404
-        assert refused.value.status_code == 403
+        assert refused.value.status_code == 404
 
 
 class TestDeleteFolderNominalPath:
     """The half of delete_folder that no cross-tenant test can reach.
 
-    Every existing case stops at the ForbiddenError, so the body of the
+    Every existing case stops at the NotFoundError, so the body of the
     function — the loop that removes the documents it contains — has never
     been executed by the suite. Dropping that loop would leave orphan rows in
     the database and orphan vectors in Qdrant, and every test would stay green.
